@@ -1,0 +1,10 @@
+﻿.venv/
+.env
+__pycache__/
+*.pyc
+*.db
+*.db-journal
+*.log
+patch_*.py
+test_leads.csv
+n8n/
