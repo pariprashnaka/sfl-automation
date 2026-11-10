@@ -8,3 +8,5 @@ __pycache__/
 patch_*.py
 test_leads.csv
 n8n/
+
+browser-profile/
