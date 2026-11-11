@@ -2409,10 +2409,15 @@ def ensure_businesses():
         c.execute("ALTER TABLE businesses ADD COLUMN last_enriched TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE queue ADD COLUMN pitch TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     c.executescript("""
     CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT, place TEXT, state TEXT DEFAULT '', country TEXT DEFAULT 'India',
       max_leads INTEGER DEFAULT 40, status TEXT DEFAULT 'pending', last_run TEXT DEFAULT '', leads_found INTEGER DEFAULT 0,
       mode TEXT DEFAULT '', note TEXT DEFAULT '', campaign_id INTEGER, enriched INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS queue_settings(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS enrich_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, queue_id INTEGER, examined INTEGER, updated INTEGER, phones_added INTEGER, emails_added INTEGER);
     """)
     c.commit()
@@ -3060,7 +3065,7 @@ REV = HEAD + """
 
 # ---- Queue, night worker, website enrichment
 ENRICH_CAP = 40
-NIGHT_CAP = 6
+NIGHT_CAP = 40                     # default daily cap (setting "daily_cap")
 NIGHT_START, NIGHT_END = 1, 6      # local hours: 01:00 up to 06:00
 QUEUE_CHECK_SECS = 600
 QUEUE_LOCK = threading.Lock()
@@ -3111,7 +3116,23 @@ def enrich_businesses(qid=None, limit=ENRICH_CAP):
     c.close()
     return examined, updated, pa, ea
 
+def qset(key, default):
+    c = conn()
+    r = c.execute("SELECT v FROM queue_settings WHERE k=?", (key,)).fetchone()
+    c.close()
+    return r["v"] if r else default
+
+def qset_save(key, val):
+    c = conn()
+    c.execute("INSERT OR REPLACE INTO queue_settings(k,v) VALUES(?,?)", (key, str(val)))
+    c.commit()
+    c.close()
+
+def first_term(entity):
+    return next((t.strip() for t in (entity or "").splitlines() if t.strip()), "")
+
 def queue_fresh(entity, place):
+    entity = first_term(entity)
     ensure_businesses()
     cutoff = (datetime.date.today() - datetime.timedelta(days=TRUST_DAYS)).isoformat()
     c = conn()
@@ -3134,7 +3155,7 @@ def run_queue_item(qid, mode):
             loc = ", ".join(x for x in (q["place"], q["state"], q["country"]) if x)
             c = conn()
             cur = c.execute("INSERT INTO campaigns(name,queries,location,pitch,language,max_leads,created) VALUES(?,?,?,?,?,?,?)",
-                            ("Queue: %s in %s" % (q["entity"], q["place"]), q["entity"], loc, "", "English", q["max_leads"] or 40, time.strftime("%Y-%m-%d %H:%M")))
+                            ("Queue: %s in %s" % (first_term(q["entity"]), q["place"]), q["entity"].strip(), loc, q["pitch"] or "", "English", q["max_leads"] or 40, time.strftime("%Y-%m-%d %H:%M")))
             cid = cur.lastrowid
             c.commit()
             c.close()
@@ -3142,7 +3163,7 @@ def run_queue_item(qid, mode):
                 c = conn()
                 camp = c.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
                 c.close()
-                city, entity, terms, places, tags, aliases = plan_leads(cid, camp, q["entity"])
+                city, entity, terms, places, tags, aliases = plan_leads(cid, camp, first_term(q["entity"]))
                 ids, last = existing_for(entity, aliases)
                 if ids:
                     c = conn()
@@ -3173,15 +3194,21 @@ def run_queue_item(qid, mode):
 def queue_tick():
     # One worker check: only in the night window, one item at a time, at most NIGHT_CAP items a night.
     h = datetime.datetime.now().hour
-    if not (NIGHT_START <= h < NIGHT_END) or RUNNING:
+    if qset("paused", "0") == "1" or RUNNING:
         return
-    start = datetime.datetime.now().replace(hour=NIGHT_START, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+    if qset("continuous", "1") != "1" and not (NIGHT_START <= h < NIGHT_END):
+        return
+    try:
+        cap = int(qset("daily_cap", NIGHT_CAP))
+    except ValueError:
+        cap = NIGHT_CAP
+    start = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
     c = conn()
     if c.execute("SELECT 1 FROM queue WHERE status='running'").fetchone():
         c.close()
         return
     used = c.execute("SELECT COUNT(*) FROM queue WHERE mode='auto' AND last_run>=? AND note NOT LIKE 'skipped%'", (start,)).fetchone()[0]
-    while used < NIGHT_CAP:
+    while used < cap:
         q = c.execute("SELECT * FROM queue WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
         if not q:
             break
@@ -3215,15 +3242,37 @@ def start_queue_worker():
 def queue_page():
     ensure_businesses()
     c = conn()
-    rows = c.execute("SELECT * FROM queue ORDER BY id DESC").fetchall()
+    allr = c.execute("SELECT * FROM queue ORDER BY id").fetchall()
     c.close()
-    return render_template_string(QUEUE, rows=rows, msg=request.args.get("msg", ""), win="%02d:00-%02d:00" % (NIGHT_START, NIGHT_END), cap=NIGHT_CAP)
+    pos, n = {}, 0
+    for r in allr:
+        if r["status"] == "pending":
+            n += 1
+            pos[r["id"]] = n
+    rank = {"running": 0, "pending": 1, "paused": 2}
+    rows = sorted([r for r in allr if r["status"] in rank], key=lambda r: (rank[r["status"]], r["id"])) +            sorted([r for r in allr if r["status"] not in rank], key=lambda r: -r["id"])
+    return render_template_string(QUEUE, rows=rows, pos=pos, npend=n, msg=request.args.get("msg", ""), win="%02d:00-%02d:00" % (NIGHT_START, NIGHT_END),
+                                  cap=qset("daily_cap", NIGHT_CAP), cont=qset("continuous", "1") == "1", qpaused=qset("paused", "0") == "1")
+
+@app.route("/queue/settings", methods=["POST"])
+def queue_settings():
+    ensure_businesses()
+    f = request.form
+    if f.get("do") == "toggle_pause":
+        qset_save("paused", "0" if qset("paused", "0") == "1" else "1")
+    else:
+        qset_save("continuous", "1" if f.get("continuous") else "0")
+        try:
+            qset_save("daily_cap", max(1, min(int(f.get("daily_cap") or NIGHT_CAP), 500)))
+        except ValueError:
+            pass
+    return redirect("/queue?msg=Saved")
 
 @app.route("/queue/add", methods=["POST"])
 def queue_add():
     ensure_businesses()
     f = request.form
-    entity = f.get("entity", "").strip()
+    entity = "\n".join(x.strip() for x in f.get("entity", "").splitlines() if x.strip())
     places = [x.strip() for x in re.split(r"[\n,]", f.get("places", "") + "\n" + f.get("place", "")) if x.strip()]
     try:
         mx = max(1, min(int(f.get("max_leads") or 40), 200))
@@ -3233,8 +3282,8 @@ def queue_add():
         return redirect("/queue?msg=Need+an+entity+and+at+least+one+place")
     c = conn()
     for pl in dict.fromkeys(places):
-        c.execute("INSERT INTO queue(entity,place,state,country,max_leads) VALUES(?,?,?,?,?)",
-                  (entity, pl, f.get("state", "").strip(), f.get("country", "India").strip() or "India", mx))
+        c.execute("INSERT INTO queue(entity,place,state,country,max_leads,pitch) VALUES(?,?,?,?,?,?)",
+                  (entity, pl, f.get("state", "").strip(), f.get("country", "India").strip() or "India", mx, f.get("pitch", "").strip()))
     c.commit()
     c.close()
     return redirect("/queue?msg=Added+%d" % len(set(places)))
@@ -3272,24 +3321,30 @@ def businesses_enrich():
 QUEUE = HEAD + """
 <div class='card'><h2>Queue</h2>
 {% if msg %}<p><b>{{msg}}</b></p>{% endif %}
-<p><small>The app checks every 10 minutes. Between {{win}} local time, with no campaign running, it runs the next pending item as a normal campaign ("Search for more"), one at a time, up to {{cap}} per night. An item whose entity+place is already in the master list within 30 days is skipped. "Run now" ignores the time window.</small></p>
+<p><b>{{npend}} pending</b> &middot; Worker: <b>{{'PAUSED' if qpaused else 'active'}}</b>
+<form method='post' action='/queue/settings' style='display:inline'><input type='hidden' name='do' value='toggle_pause'><button class='grey' style='padding:2px 8px'>{{'Resume' if qpaused else 'Pause'}} queue</button></form></p>
+<form method='post' action='/queue/settings' style='display:flex;gap:12px;align-items:center;flex-wrap:wrap'>
+<label><input type='checkbox' name='continuous' {{'checked' if cont}} style='width:auto;margin:0'> Run continuously (all day; off = only {{win}})</label>
+<label>Daily cap <input name='daily_cap' type='number' value='{{cap}}' style='margin:0;width:80px'></label><button>Save settings</button></form>
+<p><small>The app checks every 10 minutes. With no campaign running it runs the next pending item as a normal campaign ("Search for more"), one at a time, up to {{cap}} per day. An item whose entity+place is already in the master list within 30 days is skipped. "Run now" ignores the time window and pause.</small></p>
 <form method='post' action='/queue/add' style='display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end'>
-<div><label>Entity</label><input name='entity' placeholder='hospitals' required style='margin:0'></div>
+<div><label>Entity / search terms (one per line)</label><textarea name='entity' rows='3' placeholder='hospitals' required style='margin:0'></textarea></div>
+<div><label>Pitch</label><input name='pitch' placeholder='hospital software' style='margin:0'></div>
 <div><label>Place (one)</label><input name='place' placeholder='Patna' style='margin:0'></div>
 <div><label>State</label><input name='state' placeholder='Bihar' style='margin:0'></div>
 <div><label>Country</label><input name='country' value='India' style='margin:0'></div>
 <div><label>Max leads</label><input name='max_leads' type='number' value='40' style='margin:0;width:90px'></div>
 <div style='flex-basis:100%'><label>Bulk: many places, one per line (same entity as above)</label><textarea name='places' rows='4' placeholder='Gaya&#10;Muzaffarpur'></textarea></div>
 <button>Add to queue</button></form></div>
-<div class='card'><table><tr><th>#</th><th>Entity</th><th>Place</th><th>State</th><th>Max</th><th>Status</th><th>Last run</th><th>Leads</th><th>Enriched</th><th></th></tr>
-{% for q in rows %}<tr><td>{{q.id}}</td><td>{{q.entity}}</td><td>{{q.place}}</td><td>{{q.state}}</td><td>{{q.max_leads}}</td>
+<div class='card'><table><tr><th>#</th><th>Pos</th><th>Entity</th><th>Place</th><th>State</th><th>Max</th><th>Status</th><th>Last run</th><th>Leads</th><th>Enriched</th><th></th></tr>
+{% for q in rows %}<tr><td>{{q.id}}</td><td>{{pos.get(q.id,'')}}</td><td style='white-space:pre-line'>{{q.entity}}</td><td>{{q.place}}</td><td>{{q.state}}</td><td>{{q.max_leads}}</td>
 <td><b>{{q.status}}</b>{% if q.note %}<br><small>{{q.note}}</small>{% endif %}</td><td>{{q.last_run}}</td>
 <td>{% if q.campaign_id %}<a href='/campaign/{{q.campaign_id}}'>{{q.leads_found}}</a>{% else %}{{q.leads_found}}{% endif %}</td><td>{{q.enriched}}</td>
 <td style='white-space:nowrap'>
 <form method='post' action='/queue/{{q.id}}/run' style='display:inline'><button style='padding:2px 8px' {{'disabled' if q.status=='running'}}>Run now</button></form>
 {% if q.status in ('pending','paused') %}<form method='post' action='/queue/{{q.id}}/pause' style='display:inline'><button class='grey' style='padding:2px 8px'>{{'Resume' if q.status=='paused' else 'Pause'}}</button></form>{% endif %}
 <form method='post' action='/queue/{{q.id}}/delete' style='display:inline'><button class='grey' style='padding:2px 8px' {{'disabled' if q.status=='running'}}>Delete</button></form></td></tr>
-{% else %}<tr><td colspan='10'>Queue is empty.</td></tr>{% endfor %}</table></div></main></body></html>"""
+{% else %}<tr><td colspan='11'>Queue is empty.</td></tr>{% endfor %}</table></div></main></body></html>"""
 
 if __name__ == "__main__":
     import sys
