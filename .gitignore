@@ -10,3 +10,9 @@ test_leads.csv
 n8n/
 
 browser-profile/
+
+osm_cache.json
+
+*.bak*
+leads.db.bak*
+osm_cache.json

@@ -13,19 +13,27 @@ TRADER = "for a stainless steel utensil trader in Buxar, Bihar"
 SOFT = "for a software company selling LIMS, billing and hospital software to small labs, shops and clinics in Bihar"
 WORLD = "and, for each, how it could affect India (oil and fuel prices, trade and exports, rupee and markets, supply chains)"
 
+STARTUP = "for an Indian founder (what changed, who it applies to, deadlines, what to do)"
+COMPLY = "for an Indian software company handling patient, lab and customer data (what changed, deadlines, what to do)"
+
 SECTIONS = {
     "Share market": ("Sensex OR Nifty OR Dalal Street OR India stock market", 8, FOUNDER),
     "Companies, earnings and IPOs": ("India quarterly results OR India IPO OR India company earnings", 6, FOUNDER),
     "Finance and economy": ("RBI OR India economy OR GST OR India inflation OR rupee", 6, FOUNDER),
-    "World conflicts and geopolitics (India impact is inferred)": ("war OR ceasefire OR missile strike OR military conflict OR sanctions", 8, WORLD),
+    "Startup policy changes (India)": ("@7d startup policy India OR Startup India OR DPIIT OR startup regulation India OR SEBI startups OR Fund of Funds for Startups", 8, STARTUP),
+    "Government announcements for startups": ("@7d PIB startup OR DPIIT OR Ministry of Commerce startup OR MeitY startup OR Startup India Seed Fund OR startup scheme announced", 8, STARTUP),
+    "DPDP Act and data-protection law (India)": ("@7d DPDP Act OR DPDP Rules OR Digital Personal Data Protection OR Data Protection Board of India OR MeitY data protection", 8, COMPLY),
     "Government policy and MSME": ("MSME India OR India subsidy scheme OR Bihar government scheme OR GST council", 6, FOUNDER),
     "Commodities and metals": ("stainless steel price India OR steel price India OR gold price India OR crude oil price", 6, TRADER),
-    "Tech and innovation (global)": ("artificial intelligence OR technology innovation OR semiconductor", 6, FOUNDER),
     "India tech and startups": ("India startup funding OR India tech OR India AI", 8, FOUNDER),
     "Healthcare and health-tech India": ("ABDM OR digital health India OR health tech India OR NMC India", 6, SOFT),
     "Your industry: LIMS, InventoryCloud, HMS": ("pathology lab software India OR billing software India OR hospital management system India", 6, SOFT),
     "Bihar and Buxar business": ("Bihar business OR Bihar industry OR Buxar", 6, TRADER),
+    "World conflicts and geopolitics (India impact is inferred)": ("geopolitics OR war OR ceasefire OR sanctions OR trade war OR tariffs OR military conflict", 8, WORLD),
+    "World finance and markets (India impact is inferred)": ("Federal Reserve OR global markets OR oil price OR US dollar OR ECB OR China economy OR IMF", 6, WORLD),
+    "Tech and innovation (global)": ("artificial intelligence OR technology innovation OR semiconductor", 6, FOUNDER),
 }
+
 TICKERS = {"Sensex": "^BSESN", "Nifty 50": "^NSEI", "Bank Nifty": "^NSEBANK", "USD/INR": "INR=X",
            "Gold (USD/oz)": "GC=F", "Brent crude (USD)": "BZ=F", "S&P 500": "^GSPC", "Nasdaq": "^IXIC"}
 
@@ -68,7 +76,52 @@ def tier_of(src):
         return 1
     return 0
 
+GROUND = "Facts, figures, names and dates must come only from the text given; never invent them. You may explain how a story could affect India, but begin every such sentence with 'Possible India impact:' so it is clearly analysis, not a reported fact."
+def gemini_log(model, ok, usage=None, error=""):
+    # Counts digest Gemini calls in leads.db gemini_calls (kind "digest"); never stores prompts, answers or keys. Must never break the digest.
+    try:
+        import sqlite3, time
+        u = usage or {}
+        c = sqlite3.connect(r"D:aultutomation\leads\leads.db", timeout=30)
+        c.execute("CREATE TABLE IF NOT EXISTS gemini_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, model TEXT, ok INTEGER, prompt_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, total_tokens INTEGER, error TEXT)")
+        c.execute("INSERT INTO gemini_calls(ts,day,kind,model,ok,prompt_tokens,output_tokens,thought_tokens,total_tokens,error) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (time.strftime("%Y-%m-%d %H:%M:%S"), time.strftime("%Y-%m-%d"), "digest", model, 1 if ok else 0,
+                   int(u.get("promptTokenCount") or 0), int(u.get("candidatesTokenCount") or 0),
+                   int(u.get("thoughtsTokenCount") or 0), int(u.get("totalTokenCount") or 0), str(error)[:200]))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+def ask_gemini(prompt):
+    # key comes from the environment (load_dotenv above); .env is never opened directly
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        return ""
+    model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
+    try:
+        r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
+                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                          json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}, timeout=60)
+        j = r.json()
+    except Exception as ex:
+        gemini_log(model, False, error="request failed: " + type(ex).__name__)
+        return ""
+    try:
+        text = j["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        gemini_log(model, False, j.get("usageMetadata") if isinstance(j, dict) else None, "HTTP " + str(r.status_code) + " no answer")
+        return ""
+    gemini_log(model, True, j.get("usageMetadata"))
+    return text
+
 def ask(prompt):
+    prompt = GROUND + "
+
+" + prompt
+    text = ask_gemini(prompt)
+    if text:
+        return text
     try:
         r = requests.post(OLLAMA, json={"model": MODEL, "prompt": prompt, "stream": False,
                                         "options": {"num_ctx": 3072}}, timeout=600)
@@ -79,8 +132,11 @@ def ask(prompt):
 def norm(t):
     return re.sub(r"[^a-z0-9 ]", "", t.lower())
 
-def fetch(query, pool=30):
-    url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(query + " when:1d") + "&hl=en-IN&gl=IN&ceid=IN:en"
+def fetch(query, pool=60):
+    win = "1d"
+    if query.startswith("@"):
+        win, query = query[1:].split(" ", 1)
+    url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(query + " when:" + win) + "&hl=en-IN&gl=IN&ceid=IN:en"
     out = []
     for e in feedparser.parse(url).entries[:pool]:
         title = e.title
@@ -118,6 +174,47 @@ def cluster(items):
         names = sorted({x["src"] for x in g if x["src"]})
         res.append({"best": best, "outlets": len(names), "names": names, "tier": best["tier"], "figs": []})
     return res
+
+import json as _json
+HISTFILE = pathlib.Path(r"D:\vault\outputs\logs\seen.json")
+
+class Seen(set):
+    def __init__(self):
+        super().__init__()
+        self.today = datetime.date.today().isoformat()
+        self.hist = []
+        try:
+            self.raw = _json.loads(HISTFILE.read_text(encoding="utf-8"))
+        except Exception:
+            self.raw = {}
+        for d, ks in self.raw.items():
+            if d != self.today:
+                self.hist += [(k, self._g(k)) for k in ks]
+
+    @staticmethod
+    def _g(k):
+        return {k[i:i + 3] for i in range(len(k) - 2)}
+
+    def __contains__(self, k):
+        if set.__contains__(self, k):
+            return True
+        g = self._g(k)
+        for hk, hg in self.hist:
+            if hk == k:
+                return True
+            if g and hg and len(g & hg) / len(g | hg) >= 0.55:
+                return True
+        return False
+
+    def add(self, k):
+        set.add(self, k)
+        self.raw[self.today] = sorted(self)
+        for d in sorted(self.raw)[:-10]:
+            self.raw.pop(d, None)
+        try:
+            HISTFILE.write_text(_json.dumps(self.raw), encoding="utf-8")
+        except Exception:
+            pass
 
 def pick(groups, n, seen):
     groups = [g for g in groups if g["best"]["key"] not in seen]
@@ -188,7 +285,7 @@ def market_table():
 
 def build():
     today = datetime.date.today().strftime("%A, %d %B %Y")
-    seen, sections, allg = set(), [], []
+    seen, sections, allg = Seen(), [], []
     for section, (query, n, angle) in SECTIONS.items():
         log("SECTION: " + section)
         raw = fetch(query)
