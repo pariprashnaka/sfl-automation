@@ -4,6 +4,7 @@
 - Never read or print `.env` (denied in `.claude/settings.json`; it holds API keys and mail credentials).
 - Research and Campaign output must be facts copied from sources, never invented.
 - The digest may add analysis only when each such sentence starts with "Possible India impact:".
+- Commit messages are plain: never add Co-Authored-By, Claude-Session or any other attribution trailers; the owner is the only author.
 - Make small edits. Copy a file to a `.bak` before editing it.
 - Restart the app with: `Stop-ScheduledTask -TaskName "CommandCentre"; Start-ScheduledTask -TaskName "CommandCentre"`
 

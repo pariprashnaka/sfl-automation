@@ -515,7 +515,7 @@ def run_campaign(cid):
             if junk_name(name):
                 log(cid, "    skipped junk name: " + str(name)[:50])
                 return
-            if wrong_match(name, phones):
+            if wrong_match(name, phones, mctx.get("city", "")):
                 log(cid, "    skipped (flagged wrong earlier): " + str(name)[:50])
                 return
             c2 = conn()
@@ -801,7 +801,7 @@ table{width:100%;border-collapse:collapse}
 th,td{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top;font-size:14px}
 pre{background:#111;color:#9fe29f;padding:10px;max-height:260px;overflow:auto;font-size:13px;border-radius:6px;white-space:pre-wrap}
 small{color:#666}
-</style></head><body><nav><div class='brand'>Command Centre</div><a href='/' class='{{"on" if request.path=="/"}}'>Home</a><a href='/campaigns' class='{{"on" if request.path.startswith("/campaign")}}'>Campaigns</a><a href='/leads' class='{{"on" if request.path=="/leads"}}'>All leads</a><a href='/businesses' class='{{"on" if request.path.startswith("/businesses")}}'>Businesses</a><a href='/digests' class='{{"on" if request.path.startswith("/digests")}}'>Digests</a><a href='/notes' class='{{'on' if request.path=='/notes'}}'>Notes</a><a href='/research' class='{{'on' if request.path.startswith('/research')}}'>Research</a><a href='/testing' class='{{'on' if request.path.startswith('/testing')}}'>Testing</a><a href='/system' class='{{"on" if request.path=="/system"}}'>System</a></nav><main>"""
+</style></head><body><nav><div class='brand'>Command Centre</div><a href='/' class='{{"on" if request.path=="/"}}'>Home</a><a href='/campaigns' class='{{"on" if request.path.startswith("/campaign")}}'>Campaigns</a><a href='/leads' class='{{"on" if request.path=="/leads"}}'>All leads</a><a href='/businesses' class='{{"on" if request.path.startswith("/businesses")}}'>Businesses</a><a href='/digests' class='{{"on" if request.path.startswith("/digests")}}'>Digests</a><a href='/notes' class='{{'on' if request.path=='/notes'}}'>Notes</a><a href='/research' class='{{'on' if request.path.startswith('/research')}}'>Research</a><a href='/testing' class='{{'on' if request.path.startswith('/testing')}}'>Testing</a><a href='/queue' class='{{"on" if request.path.startswith("/queue")}}'>Queue</a><a href='/system' class='{{"on" if request.path=="/system"}}'>System</a></nav><main>"""
 
 HOME = HEAD + """
 <div class='card'><h2>New campaign</h2>
@@ -2327,7 +2327,13 @@ def system():
     g_rows, g_models, g_err = gemini_usage(14)
     tot = [sum(r[1][i] for r in day_rows) for i in range(5)]
     g_tot = {k: sum((r[k] or 0) for r in g_rows) for k in ("calls", "ok", "bad", "pt", "ot", "tt", "tot", "fb")}
-    return render_template_string(SYS, day_rows=day_rows, proj_rows=proj_rows, files=files, errors=errors, tot=tot,
+    ensure_businesses()
+    c = conn()
+    since = (datetime.datetime.now() - datetime.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+    q_rows = c.execute("SELECT * FROM queue WHERE last_run>=? ORDER BY last_run DESC", (since,)).fetchall()
+    e_row = c.execute("SELECT COUNT(*) n, COALESCE(SUM(examined),0) ex, COALESCE(SUM(updated),0) up, COALESCE(SUM(phones_added),0) pa, COALESCE(SUM(emails_added),0) ea FROM enrich_log WHERE ts>=?", (since,)).fetchone()
+    c.close()
+    return render_template_string(SYS, q_rows=q_rows, e_row=e_row, day_rows=day_rows, proj_rows=proj_rows, files=files, errors=errors, tot=tot,
                                   g_rows=g_rows, g_models=g_models, g_err=g_err, g_tot=g_tot, model=MODEL)
 
 SYS = HEAD + """
@@ -2343,6 +2349,12 @@ SYS = HEAD + """
 {% else %}<tr><td colspan='6'>No Claude Code usage found in the last 14 days.</td></tr>{% endfor %}</table>
 <p style='margin-top:12px'><a class='btn' href='https://claude.ai/settings/usage' target='_blank' rel='noopener'>Open claude.ai usage</a>
 <small>Your plan usage percentage is shown only there. These logs hold token counts only, not your plan limit, so this page cannot show a percentage.</small></p></div>
+
+<div class='card'><h3>Queue activity, last 24 hours</h3>
+<table><tr><th>Item</th><th>Status</th><th>Run</th><th>Mode</th><th>Leads found</th><th>Businesses enriched</th></tr>
+{% for q in q_rows %}<tr><td>{{q.entity}} in {{q.place}}</td><td>{{q.status}}{% if q.note %} <small>({{q.note}})</small>{% endif %}</td><td>{{q.last_run}}</td><td>{{q.mode}}</td><td>{{q.leads_found}}</td><td>{{q.enriched}}</td></tr>
+{% else %}<tr><td colspan='6'>No queue items ran in the last 24 hours.</td></tr>{% endfor %}</table>
+<p><small>Website enrichment in this period: {{e_row.n}} run(s), {{e_row.ex}} business(es) scanned, {{e_row.up}} gained contacts ({{e_row.pa}} phone(s), {{e_row.ea}} email(s)).</small></p></div>
 
 <div class='card'><h3>Usage: this app's Gemini calls, last 14 days</h3>
 <p><small>Counted by this app since logging was added (earlier calls are not included). Each row counts every API attempt; failed attempts may lack token counts. Calls made by the separate morning-digest script are not included.</small></p>
@@ -2393,6 +2405,16 @@ def ensure_businesses():
         c.execute("ALTER TABLE campaigns ADD COLUMN prestart TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE businesses ADD COLUMN last_enriched TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS queue(id INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT, place TEXT, state TEXT DEFAULT '', country TEXT DEFAULT 'India',
+      max_leads INTEGER DEFAULT 40, status TEXT DEFAULT 'pending', last_run TEXT DEFAULT '', leads_found INTEGER DEFAULT 0,
+      mode TEXT DEFAULT '', note TEXT DEFAULT '', campaign_id INTEGER, enriched INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS enrich_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, queue_id INTEGER, examined INTEGER, updated INTEGER, phones_added INTEGER, emails_added INTEGER);
+    """)
     c.commit()
     c.close()
     _BIZ_READY = True
@@ -2772,13 +2794,27 @@ def match_biz(rows, name, phones):
             return r
     return None
 
-def wrong_match(name, phones):
+def wrong_match(name, phones, city=""):
+    # A wrong flag blocks only the exact same business: same normalised name in the same city, or the same phone.
+    # "Verma" flagged wrong must not block "Verma Hospital".
     try:
         ensure_businesses()
         c = conn()
-        rows = c.execute("SELECT id, name, name_key, phones FROM businesses WHERE status='wrong'").fetchall()
+        rows = c.execute("SELECT id, name, name_key, phones, city FROM businesses WHERE status='wrong'").fetchall()
         c.close()
-        return match_biz(rows, name, phones) is not None
+        keys = {name_key_of(clean_name(name)), name_key_of(re.sub(r"\s+", " ", str(name or "")).strip()[:120])}
+        ph = {p10(x) for x in (phones or []) if p10(x)}
+        cl = (city or "").strip().lower()
+        for r in rows:
+            if r["name_key"] in keys and (not cl or not (r["city"] or "").strip() or (r["city"] or "").strip().lower() == cl):
+                return True
+            try:
+                bp = {p10(p["n"]) for p in json.loads(r["phones"] or "[]")}
+            except Exception:
+                bp = set()
+            if ph & bp:
+                return True
+        return False
     except Exception:
         return False
 
@@ -2972,7 +3008,7 @@ def businesses_review_act(rid):
     return redirect("/businesses/review")
 
 BIZ = HEAD + """
-<div class='card'><h2>Businesses <small>({{total}} match{% if review_n %} &middot; <a href='/businesses/review'>{{review_n}} to review</a>{% endif %})</small></h2>
+<div class='card'><form method='post' action='/businesses/enrich' style='float:right'><button class='grey' title='Scan websites of up to 40 businesses missing a phone or email (not enriched in 30 days)'>Enrich from websites</button></form>{% if request.args.get('enriching') %}<p style='color:#166534'>Enrichment started in the background; see the System page for counts.</p>{% endif %}<h2>Businesses <small>({{total}} match{% if review_n %} &middot; <a href='/businesses/review'>{{review_n}} to review</a>{% endif %})</small></h2>
 <form method='get' style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center'>
 <input name='q' value='{{f.q}}' placeholder='Search name, address, phone, email, notes' style='margin:0;flex:2;min-width:200px'>
 {% for col, label in [('category','Category'),('state','State'),('city','City'),('status','Status')] %}
@@ -3021,6 +3057,240 @@ REV = HEAD + """
 {% else %}<p>Nothing to review.</p>{% endfor %}
 <p><a href='/businesses'>Back to businesses</a></p></div></main></body></html>"""
 
+
+# ---- Queue, night worker, website enrichment
+ENRICH_CAP = 40
+NIGHT_CAP = 6
+NIGHT_START, NIGHT_END = 1, 6      # local hours: 01:00 up to 06:00
+QUEUE_CHECK_SECS = 600
+QUEUE_LOCK = threading.Lock()
+
+def enrich_businesses(qid=None, limit=ENRICH_CAP):
+    # Businesses with a website but no phone or no email, not enriched in the last 30 days: scan the homepage and its contact page.
+    # Only visible phones/emails are taken (scan -> visible_contacts); each is merged with its source URL and date.
+    ensure_businesses()
+    day = now_day()
+    cutoff = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+    c = conn()
+    rows = c.execute("SELECT * FROM businesses WHERE website<>'' AND status<>'wrong' AND do_not_contact=0 AND (phones='[]' OR emails='[]') "
+                     "AND (last_enriched IS NULL OR last_enriched='' OR last_enriched<?) ORDER BY last_seen DESC, id LIMIT ?", (cutoff, limit)).fetchall()
+    examined = updated = pa = ea = 0
+    for r in rows:
+        examined += 1
+        b = b_load(r)
+        got_p = got_e = 0
+        try:
+            phones, emails = scan(b["website"])
+        except Exception:
+            phones, emails = [], []
+        have = {p["n"] for p in b["phones"]}
+        for raw in phones:
+            np_ = norm_phone("0" + str(raw)[-10:] if str(raw)[-10:] in TRUNK0 else raw)
+            if np_ and np_[0] not in have:
+                b["phones"].append({"n": np_[0], "t": np_[1]})
+                have.add(np_[0])
+                add_source(b["sources"], "phone", np_[0], b["website"], day)
+                got_p += 1
+        for e in emails:
+            if e not in b["emails"]:
+                b["emails"].append(e)
+                add_source(b["sources"], "email", e, b["website"], day)
+                got_e += 1
+        b["quality_score"] = score_of(b)
+        lv = day if (got_p or got_e) else (r["last_verified"] or "")
+        c.execute("UPDATE businesses SET phones=?,emails=?,sources=?,quality_score=?,last_verified=?,last_enriched=? WHERE id=?",
+                  (json.dumps(b["phones"]), json.dumps(b["emails"]), json.dumps(b["sources"]), b["quality_score"], lv, day, r["id"]))
+        c.commit()
+        if got_p or got_e:
+            updated += 1
+        pa += got_p
+        ea += got_e
+    c.execute("INSERT INTO enrich_log(ts,queue_id,examined,updated,phones_added,emails_added) VALUES(?,?,?,?,?,?)",
+              (time.strftime("%Y-%m-%d %H:%M"), qid, examined, updated, pa, ea))
+    c.commit()
+    c.close()
+    return examined, updated, pa, ea
+
+def queue_fresh(entity, place):
+    ensure_businesses()
+    cutoff = (datetime.date.today() - datetime.timedelta(days=TRUST_DAYS)).isoformat()
+    c = conn()
+    rows = c.execute("SELECT category FROM businesses WHERE lower(city)=? AND last_seen>=? AND status<>'wrong'", (place.strip().lower(), cutoff)).fetchall()
+    c.close()
+    return any(cat_match(entity, r["category"]) for r in rows)
+
+def run_queue_item(qid, mode):
+    # Runs one queue item as a normal campaign, choosing "Search for more" automatically (no banner), then enriches.
+    with QUEUE_LOCK:
+        c = conn()
+        q = c.execute("SELECT * FROM queue WHERE id=?", (qid,)).fetchone()
+        if not q or q["status"] == "running":
+            c.close()
+            return
+        c.execute("UPDATE queue SET status='running', last_run=?, mode=?, note='' WHERE id=?", (time.strftime("%Y-%m-%d %H:%M"), mode, qid))
+        c.commit()
+        c.close()
+        try:
+            loc = ", ".join(x for x in (q["place"], q["state"], q["country"]) if x)
+            c = conn()
+            cur = c.execute("INSERT INTO campaigns(name,queries,location,pitch,language,max_leads,created) VALUES(?,?,?,?,?,?,?)",
+                            ("Queue: %s in %s" % (q["entity"], q["place"]), q["entity"], loc, "", "English", q["max_leads"] or 40, time.strftime("%Y-%m-%d %H:%M")))
+            cid = cur.lastrowid
+            c.commit()
+            c.close()
+            try:
+                c = conn()
+                camp = c.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
+                c.close()
+                city, entity, terms, places, tags, aliases = plan_leads(cid, camp, q["entity"])
+                ids, last = existing_for(entity, aliases)
+                if ids:
+                    c = conn()
+                    for bid in ids:
+                        link_campaign(c, cid, bid, "existing")
+                    c.execute("UPDATE campaigns SET prestart=? WHERE id=?", (json.dumps({"state": "more", "n": len(ids), "last": last, "ids": ids}), cid))
+                    c.commit()
+                    c.close()
+            except Exception as ex:
+                log(cid, "  queue pre-check skipped: " + str(ex)[:100])
+            run_campaign(cid)
+            c = conn()
+            n = c.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=? AND wrong=0", (cid,)).fetchone()[0]
+            c.execute("UPDATE queue SET leads_found=?, campaign_id=? WHERE id=?", (n, cid, qid))
+            c.commit()
+            c.close()
+            ex_, up, pa, ea = enrich_businesses(qid)
+            c = conn()
+            c.execute("UPDATE queue SET status='done', enriched=? WHERE id=?", (up, qid))
+            c.commit()
+            c.close()
+        except Exception as ex:
+            c = conn()
+            c.execute("UPDATE queue SET status='failed', note=? WHERE id=?", (str(ex)[:200], qid))
+            c.commit()
+            c.close()
+
+def queue_tick():
+    # One worker check: only in the night window, one item at a time, at most NIGHT_CAP items a night.
+    h = datetime.datetime.now().hour
+    if not (NIGHT_START <= h < NIGHT_END) or RUNNING:
+        return
+    start = datetime.datetime.now().replace(hour=NIGHT_START, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+    c = conn()
+    if c.execute("SELECT 1 FROM queue WHERE status='running'").fetchone():
+        c.close()
+        return
+    used = c.execute("SELECT COUNT(*) FROM queue WHERE mode='auto' AND last_run>=? AND note NOT LIKE 'skipped%'", (start,)).fetchone()[0]
+    while used < NIGHT_CAP:
+        q = c.execute("SELECT * FROM queue WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        if not q:
+            break
+        if queue_fresh(q["entity"], q["place"]):
+            c.execute("UPDATE queue SET status='done', last_run=?, mode='auto', note='skipped: master list already has it within 30 days' WHERE id=?",
+                      (time.strftime("%Y-%m-%d %H:%M"), q["id"]))
+            c.commit()
+            continue
+        c.close()
+        run_queue_item(q["id"], "auto")
+        return
+    c.close()
+
+def queue_worker():
+    while True:
+        try:
+            queue_tick()
+        except Exception as ex:
+            print("queue worker error:", ex)
+        time.sleep(QUEUE_CHECK_SECS)
+
+def start_queue_worker():
+    ensure_businesses()
+    c = conn()
+    c.execute("UPDATE queue SET status='pending', note='interrupted by restart' WHERE status='running'")
+    c.commit()
+    c.close()
+    threading.Thread(target=queue_worker, daemon=True).start()
+
+@app.route("/queue")
+def queue_page():
+    ensure_businesses()
+    c = conn()
+    rows = c.execute("SELECT * FROM queue ORDER BY id DESC").fetchall()
+    c.close()
+    return render_template_string(QUEUE, rows=rows, msg=request.args.get("msg", ""), win="%02d:00-%02d:00" % (NIGHT_START, NIGHT_END), cap=NIGHT_CAP)
+
+@app.route("/queue/add", methods=["POST"])
+def queue_add():
+    ensure_businesses()
+    f = request.form
+    entity = f.get("entity", "").strip()
+    places = [x.strip() for x in re.split(r"[\n,]", f.get("places", "") + "\n" + f.get("place", "")) if x.strip()]
+    try:
+        mx = max(1, min(int(f.get("max_leads") or 40), 200))
+    except ValueError:
+        mx = 40
+    if not entity or not places:
+        return redirect("/queue?msg=Need+an+entity+and+at+least+one+place")
+    c = conn()
+    for pl in dict.fromkeys(places):
+        c.execute("INSERT INTO queue(entity,place,state,country,max_leads) VALUES(?,?,?,?,?)",
+                  (entity, pl, f.get("state", "").strip(), f.get("country", "India").strip() or "India", mx))
+    c.commit()
+    c.close()
+    return redirect("/queue?msg=Added+%d" % len(set(places)))
+
+@app.route("/queue/<int:qid>/<act>", methods=["POST"])
+def queue_act(qid, act):
+    ensure_businesses()
+    c = conn()
+    q = c.execute("SELECT * FROM queue WHERE id=?", (qid,)).fetchone()
+    msg = ""
+    if not q:
+        c.close()
+        return redirect("/queue")
+    if act == "delete" and q["status"] != "running":
+        c.execute("DELETE FROM queue WHERE id=?", (qid,))
+    elif act == "pause" and q["status"] == "pending":
+        c.execute("UPDATE queue SET status='paused' WHERE id=?", (qid,))
+    elif act == "pause" and q["status"] == "paused":
+        c.execute("UPDATE queue SET status='pending' WHERE id=?", (qid,))
+    elif act == "run" and q["status"] != "running":
+        if RUNNING:
+            msg = "A campaign is already running; try again when it finishes"
+        else:
+            threading.Thread(target=run_queue_item, args=(qid, "manual"), daemon=True).start()
+            msg = "Started"
+    c.commit()
+    c.close()
+    return redirect("/queue" + ("?msg=" + urllib.parse.quote_plus(msg) if msg else ""))
+
+@app.route("/businesses/enrich", methods=["POST"])
+def businesses_enrich():
+    threading.Thread(target=enrich_businesses, daemon=True).start()
+    return redirect("/businesses?enriching=1")
+
+QUEUE = HEAD + """
+<div class='card'><h2>Queue</h2>
+{% if msg %}<p><b>{{msg}}</b></p>{% endif %}
+<p><small>The app checks every 10 minutes. Between {{win}} local time, with no campaign running, it runs the next pending item as a normal campaign ("Search for more"), one at a time, up to {{cap}} per night. An item whose entity+place is already in the master list within 30 days is skipped. "Run now" ignores the time window.</small></p>
+<form method='post' action='/queue/add' style='display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end'>
+<div><label>Entity</label><input name='entity' placeholder='hospitals' required style='margin:0'></div>
+<div><label>Place (one)</label><input name='place' placeholder='Patna' style='margin:0'></div>
+<div><label>State</label><input name='state' placeholder='Bihar' style='margin:0'></div>
+<div><label>Country</label><input name='country' value='India' style='margin:0'></div>
+<div><label>Max leads</label><input name='max_leads' type='number' value='40' style='margin:0;width:90px'></div>
+<div style='flex-basis:100%'><label>Bulk: many places, one per line (same entity as above)</label><textarea name='places' rows='4' placeholder='Gaya&#10;Muzaffarpur'></textarea></div>
+<button>Add to queue</button></form></div>
+<div class='card'><table><tr><th>#</th><th>Entity</th><th>Place</th><th>State</th><th>Max</th><th>Status</th><th>Last run</th><th>Leads</th><th>Enriched</th><th></th></tr>
+{% for q in rows %}<tr><td>{{q.id}}</td><td>{{q.entity}}</td><td>{{q.place}}</td><td>{{q.state}}</td><td>{{q.max_leads}}</td>
+<td><b>{{q.status}}</b>{% if q.note %}<br><small>{{q.note}}</small>{% endif %}</td><td>{{q.last_run}}</td>
+<td>{% if q.campaign_id %}<a href='/campaign/{{q.campaign_id}}'>{{q.leads_found}}</a>{% else %}{{q.leads_found}}{% endif %}</td><td>{{q.enriched}}</td>
+<td style='white-space:nowrap'>
+<form method='post' action='/queue/{{q.id}}/run' style='display:inline'><button style='padding:2px 8px' {{'disabled' if q.status=='running'}}>Run now</button></form>
+{% if q.status in ('pending','paused') %}<form method='post' action='/queue/{{q.id}}/pause' style='display:inline'><button class='grey' style='padding:2px 8px'>{{'Resume' if q.status=='paused' else 'Pause'}}</button></form>{% endif %}
+<form method='post' action='/queue/{{q.id}}/delete' style='display:inline'><button class='grey' style='padding:2px 8px' {{'disabled' if q.status=='running'}}>Delete</button></form></td></tr>
+{% else %}<tr><td colspan='10'>Queue is empty.</td></tr>{% endfor %}</table></div></main></body></html>"""
+
 if __name__ == "__main__":
     import sys
     if sys.stdout is None or sys.stderr is None:
@@ -3031,5 +3301,6 @@ if __name__ == "__main__":
     ensure_tests()
     ensure_research()
     research_cleanup()
+    start_queue_worker()
     print("Lead campaigns running. Open http://127.0.0.1:5000 in your browser. Keep this window open.")
     app.run(host="127.0.0.1", port=5000, debug=False)
