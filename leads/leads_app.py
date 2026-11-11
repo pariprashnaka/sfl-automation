@@ -30,6 +30,10 @@ def init():
     CREATE TABLE IF NOT EXISTS campaigns(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, queries TEXT, location TEXT, pitch TEXT, language TEXT, max_leads INTEGER, created TEXT);
     CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, title TEXT, url TEXT, domain TEXT, snippet TEXT, phones TEXT, emails TEXT, status TEXT DEFAULT 'New', notes TEXT DEFAULT '', draft TEXT DEFAULT '', created TEXT);
     """)
+    try:
+        c.execute("ALTER TABLE leads ADD COLUMN wrong INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     c.commit()
     c.close()
     ensure_businesses()
@@ -428,10 +432,44 @@ def clean_emails(lst):
             out.append(e)
     return out[:3]
 
+JUNK_NAME = re.compile(r"^(contact(\s+us)?|home|about(\s+us)?|government hospitals?|hospitals?|(best\s+|top\s+)?hospitals?\s+(in|near)\b.*)$", re.I)
+
+def junk_name(name):
+    n = re.sub(r"\s+", " ", str(name or "")).strip(" .,:;-|")
+    return sum(ch.isalpha() for ch in n) < 3 or bool(JUNK_NAME.match(n))
+
+def add_feedback(entity, name, verdict):
+    ensure_businesses()
+    c = conn()
+    c.execute("INSERT INTO lead_feedback(entity,name,verdict,date) VALUES(?,?,?,?)",
+              (re.sub(r"\s+", " ", str(entity or "").lower()).strip(), re.sub(r"\s+", " ", str(name or "")).strip()[:120], verdict, time.strftime("%Y-%m-%d")))
+    c.commit()
+    c.close()
+
+def feedback_lines(entity):
+    # up to 3 recent good and 3 recent wrong names the user marked for this entity, as short few-shot lines
+    try:
+        ensure_businesses()
+        key = re.sub(r"\s+", " ", str(entity or "").lower()).strip()
+        c = conn()
+        out = []
+        for v, ans in (("good", "YES"), ("wrong", "NO")):
+            seen = []
+            for r in c.execute("SELECT name FROM lead_feedback WHERE entity=? AND verdict=? ORDER BY id DESC LIMIT 20", (key, v)):
+                if r["name"] not in seen:
+                    seen.append(r["name"])
+            out += ['"' + n + '" = ' + ans for n in seen[:3]]
+        c.close()
+        return out
+    except Exception:
+        return []
+
 def relevant(entity, title, body):
     try:
+        ex = feedback_lines(entity)
         out = ask_research("Answer only YES or NO. Is this web page from a business that sells, makes or provides: " + entity +
-                           "? Page title: " + title[:120] + " | Description: " + body[:300], 1024)
+                           "? " + (("Earlier decisions by the user for this kind of business: " + "; ".join(ex) + ". ") if ex else "") +
+                           "Page title: " + title[:120] + " | Description: " + body[:300], 1024)
         return not out.strip().upper().startswith("NO")
     except Exception:
         return True
@@ -474,6 +512,12 @@ def run_campaign(cid):
 
         def save(name, url, dom, snippet, phones, emails, notes="", biz=None):
             nonlocal total
+            if junk_name(name):
+                log(cid, "    skipped junk name: " + str(name)[:50])
+                return
+            if wrong_match(name, phones):
+                log(cid, "    skipped (flagged wrong earlier): " + str(name)[:50])
+                return
             c2 = conn()
             c2.execute("INSERT INTO leads(campaign_id,title,url,domain,snippet,phones,emails,notes,created) VALUES(?,?,?,?,?,?,?,?,?)",
                        (cid, name, url, dom, snippet[:500], ",".join(phones), ",".join(emails), notes, time.strftime("%Y-%m-%d %H:%M")))
@@ -486,7 +530,7 @@ def run_campaign(cid):
                 res = master_save(cid, mctx, name, url, snippet, phones, emails, biz or {})
                 if res:
                     log(cid, "      master list: " + {"new": "new business", "merged": "merged into existing #%s (matched by %s)" % (res[1], res[2]),
-                                                      "review": "sent to review (%s)" % res[2]}[res[0]])
+                                                      "review": "sent to review (%s)" % res[2], "wrong": "matches a wrong-flagged business, not added"}[res[0]])
             except Exception as ex:
                 log(cid, "      master list error: " + str(ex)[:120])
 
@@ -727,7 +771,7 @@ def draft_all(cid):
     try:
         c = conn()
         camp = c.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
-        rows = c.execute("SELECT * FROM leads WHERE campaign_id=? AND (draft IS NULL OR draft='')", (cid,)).fetchall()
+        rows = c.execute("SELECT * FROM leads WHERE campaign_id=? AND wrong=0 AND (draft IS NULL OR draft='')", (cid,)).fetchall()
         c.close()
         log(cid, "=== Writing " + str(len(rows)) + " first messages with the local AI ===")
         for l in rows:
@@ -812,10 +856,10 @@ CAMP = HEAD + """
 <input name='q' value='{{q}}' placeholder='Search name, phone, email, website, notes' style='margin:0'>
 <select name='status' style='margin:0;width:190px'><option value=''>All statuses</option>{% for st in statuses %}<option {{'selected' if st==status}}>{{st}}</option>{% endfor %}</select>
 <select name='has' style='margin:0;width:150px'><option value=''>Any contact</option><option value='phone' {{'selected' if has=='phone'}}>Has phone</option><option value='email' {{'selected' if has=='email'}}>Has email</option></select>
-<button style='margin:0'>Filter</button></form>
+<label style='font-size:12px;white-space:nowrap'><input type='checkbox' name='show_wrong' value='1' {{'checked' if sw}} style='width:auto;margin:0 4px'>show wrong</label><button style='margin:0'>Filter</button></form>
 {% set pager %}<p>Page {{page}} of {{pages}} &nbsp; {% if page>1 %}<a class='btn grey' href='?{{qs}}&page={{page-1}}'>Prev</a>{% endif %}{% if page<pages %}<a class='btn grey' href='?{{qs}}&page={{page+1}}'>Next</a>{% endif %}</p>{% endset %}
 {{pager|safe}}
-<table><tr><th style='width:4%'>#</th><th style='width:30%'>Business</th><th style='width:13%'>Phone</th><th style='width:20%'>Email</th><th style='width:13%'>Status</th><th>Notes</th></tr>
+<table><tr><th style='width:4%'>#</th><th style='width:30%'>Business</th><th style='width:13%'>Phone</th><th style='width:20%'>Email</th><th style='width:13%'>Status</th><th>Notes</th><th>Verdict</th></tr>
 {% for l in leads %}<tr>
 <td>{{loop.index + (page-1)*50}}</td>
 <td><b><a href='{{l.url}}' target='_blank'>{{(l.title or l.domain)[:70]}}</a></b><br><small>{{l.domain}}</small></td>
@@ -823,10 +867,12 @@ CAMP = HEAD + """
 <td>{% for e in l.emails.split(',') if e %}<div><small>{{e}}</small></div>{% endfor %}</td>
 <td><select id='s{{l.id}}' onchange="save({{l.id}})">{% for st in statuses %}<option {{'selected' if st==l.status}}>{{st}}</option>{% endfor %}</select></td>
 <td><input id='n{{l.id}}' value='{{l.notes}}' placeholder='notes' onchange="save({{l.id}})" style='margin:0'></td>
+<td style='white-space:nowrap'>{% if l.wrong %}<b>wrong</b>{% else %}<button class='grey' onclick="verdict({{l.id}},'good')" style='padding:2px 8px'>Good</button> <button onclick="verdict({{l.id}},'wrong')" style='padding:2px 8px'>Wrong</button>{% endif %}</td>
 </tr>{% endfor %}</table>
 {{pager|safe}}</div>
 <script>
 var CID={{c.id}};
+function verdict(id,v){fetch('/api/lead/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verdict:v})}).then(function(){if(v=='wrong'){document.getElementById('s'+id).closest('tr').style.display='none';}});}
 function save(id){
   var body={status:document.getElementById('s'+id).value,notes:document.getElementById('n'+id).value};
   fetch('/api/lead/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -903,10 +949,10 @@ ALL = HEAD + """
 <select name='camp' style='margin:0;width:200px'><option value=''>All campaigns</option>{% for c in camps %}<option value='{{c.id}}' {{'selected' if c.id|string==camp}}>{{c.name}}</option>{% endfor %}</select>
 <select name='status' style='margin:0;width:160px'><option value=''>All statuses</option>{% for st in statuses %}<option {{'selected' if st==status}}>{{st}}</option>{% endfor %}</select>
 <select name='has' style='margin:0;width:140px'><option value=''>Any contact</option><option value='phone' {{'selected' if has=='phone'}}>Has phone</option><option value='email' {{'selected' if has=='email'}}>Has email</option></select>
-<button style='margin:0'>Filter</button></form>
+<label style='font-size:12px;white-space:nowrap'><input type='checkbox' name='show_wrong' value='1' {{'checked' if sw}} style='width:auto;margin:0 4px'>show wrong</label><button style='margin:0'>Filter</button></form>
 {% set pager %}<p>Page {{page}} of {{pages}} &nbsp; {% if page>1 %}<a class='btn grey' href='?{{qs}}&page={{page-1}}'>Prev</a>{% endif %}{% if page<pages %}<a class='btn grey' href='?{{qs}}&page={{page+1}}'>Next</a>{% endif %}</p>{% endset %}
 {{pager|safe}}
-<table><tr><th style='width:4%'>#</th><th style='width:26%'>Business</th><th style='width:14%'>Campaign</th><th style='width:12%'>Phone</th><th style='width:18%'>Email</th><th style='width:12%'>Status</th><th>Notes</th></tr>
+<table><tr><th style='width:4%'>#</th><th style='width:26%'>Business</th><th style='width:14%'>Campaign</th><th style='width:12%'>Phone</th><th style='width:18%'>Email</th><th style='width:12%'>Status</th><th>Notes</th><th>Verdict</th></tr>
 {% for l in leads %}<tr>
 <td>{{loop.index + (page-1)*50}}</td>
 <td><b><a href='{{l.url}}' target='_blank'>{{(l.title or l.domain)[:70]}}</a></b><br><small>{{l.domain}}</small></td>
@@ -915,9 +961,11 @@ ALL = HEAD + """
 <td>{% for e in l.emails.split(',') if e %}<div><small>{{e}}</small></div>{% endfor %}</td>
 <td><select id='s{{l.id}}' onchange="save({{l.id}})">{% for st in statuses %}<option {{'selected' if st==l.status}}>{{st}}</option>{% endfor %}</select></td>
 <td><input id='n{{l.id}}' value='{{l.notes}}' placeholder='notes' onchange="save({{l.id}})" style='margin:0'></td>
+<td style='white-space:nowrap'>{% if l.wrong %}<b>wrong</b>{% else %}<button class='grey' onclick="verdict({{l.id}},'good')" style='padding:2px 8px'>Good</button> <button onclick="verdict({{l.id}},'wrong')" style='padding:2px 8px'>Wrong</button>{% endif %}</td>
 </tr>{% endfor %}</table>
 {{pager|safe}}</div>
 <script>
+function verdict(id,v){fetch('/api/lead/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verdict:v})}).then(function(){if(v=='wrong'){document.getElementById('s'+id).closest('tr').style.display='none';}});}
 function save(id){
   var body={status:document.getElementById('s'+id).value,notes:document.getElementById('n'+id).value};
   fetch('/api/lead/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -930,7 +978,7 @@ def dashboard():
     c = conn()
     week = (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
     n_camp = c.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0]
-    n_leads = c.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+    n_leads = c.execute("SELECT COUNT(*) FROM leads WHERE wrong=0").fetchone()[0]
     new_week = c.execute("SELECT COUNT(*) FROM leads WHERE created>=?", (week,)).fetchone()[0]
     worked = c.execute("SELECT COUNT(*) FROM leads WHERE status<>'New'").fetchone()[0]
     counts = {r["status"]: r["n"] for r in c.execute("SELECT status, COUNT(*) AS n FROM leads GROUP BY status")}
@@ -954,6 +1002,9 @@ def all_leads():
         page = 1
     per = 50
     where, args = ["1=1"], []
+    sw = request.args.get("show_wrong", "")
+    if not sw:
+        where.append("l.wrong=0")
     if q:
         where.append("(l.title LIKE ? OR l.phones LIKE ? OR l.emails LIKE ? OR l.notes LIKE ? OR l.domain LIKE ?)")
         args += ["%" + q + "%"] * 5
@@ -976,9 +1027,9 @@ def all_leads():
                       " ORDER BY l.id DESC LIMIT ? OFFSET ?", args + [per, (page - 1) * per]).fetchall()
     camps = c.execute("SELECT id, name FROM campaigns ORDER BY id DESC").fetchall()
     c.close()
-    qs = urllib.parse.urlencode({"q": q, "status": status, "has": has, "camp": camp})
+    qs = urllib.parse.urlencode({"q": q, "status": status, "has": has, "camp": camp, "show_wrong": sw})
     return render_template_string(ALL, leads=leads, camps=camps, statuses=STATUSES, total=total, page=page, pages=pages,
-                                  q=q, status=status, has=has, camp=camp, qs=qs)
+                                  q=q, status=status, has=has, camp=camp, qs=qs, sw=sw)
 
 REPORTS = pathlib.Path(r"D:\vault\outputs\reports")
 DLOG = pathlib.Path(r"D:\vault\outputs\logs\digest.log")
@@ -2039,7 +2090,7 @@ def research_delete(rid):
 @app.route("/campaigns")
 def campaigns():
     c = conn()
-    camps = c.execute("SELECT c.*, (SELECT COUNT(*) FROM leads l WHERE l.campaign_id=c.id) AS n FROM campaigns c ORDER BY c.id DESC").fetchall()
+    camps = c.execute("SELECT c.*, (SELECT COUNT(*) FROM leads l WHERE l.campaign_id=c.id AND l.wrong=0) AS n FROM campaigns c ORDER BY c.id DESC").fetchall()
     c.close()
     return render_template_string(HOME, camps=camps)
 
@@ -2067,6 +2118,9 @@ def view(cid):
         page = 1
     per = 50
     where, args = ["campaign_id=?"], [cid]
+    sw = request.args.get("show_wrong", "")
+    if not sw:
+        where.append("wrong=0")
     if q:
         where.append("(title LIKE ? OR phones LIKE ? OR emails LIKE ? OR notes LIKE ? OR domain LIKE ?)")
         args += ["%" + q + "%"] * 5
@@ -2088,13 +2142,13 @@ def view(cid):
     page = min(page, pages)
     leads = c.execute("SELECT * FROM leads WHERE " + w + " ORDER BY id LIMIT ? OFFSET ?", args + [per, (page - 1) * per]).fetchall()
     c.close()
-    qs = urllib.parse.urlencode({"q": q, "status": status, "has": has})
+    qs = urllib.parse.urlencode({"q": q, "status": status, "has": has, "show_wrong": sw})
     try:
         pre = json.loads(camp["prestart"]) if camp["prestart"] else {}
     except Exception:
         pre = {}
     return render_template_string(CAMP, c=camp, leads=leads, statuses=STATUSES, qline=" | ".join(camp["queries"].splitlines()),
-                                  total=total, page=page, pages=pages, q=q, status=status, has=has, qs=qs, pre=pre)
+                                  total=total, page=page, pages=pages, q=q, status=status, has=has, qs=qs, pre=pre, sw=sw)
 
 @app.route("/api/run/<int:cid>", methods=["POST"])
 def api_run(cid):
@@ -2190,7 +2244,7 @@ def import_csv(cid):
 @app.route("/campaign/<int:cid>/export.csv")
 def export(cid):
     c = conn()
-    rows = c.execute("SELECT * FROM leads WHERE campaign_id=? ORDER BY id", (cid,)).fetchall()
+    rows = c.execute("SELECT * FROM leads WHERE campaign_id=? AND wrong=0 ORDER BY id", (cid,)).fetchall()
     c.close()
     out = io.StringIO()
     w = csv.writer(out)
@@ -2305,7 +2359,7 @@ SYS = HEAD + """
 TRUST_DAYS = 30        # businesses seen within this many days are offered before a new search starts
 NEAR_M = 200           # two records this close (metres) can be the same shop
 PLAN_TTL = 600         # seconds a search plan is reused (the pre-check and the run share one plan)
-BIZ_STATUSES = ["new", "contacted", "interested", "not interested", "customer"]
+BIZ_STATUSES = ["new", "contacted", "interested", "not interested", "customer", "wrong"]
 PLAN_CACHE = {}
 BIZ_COUNTS = {}
 
@@ -2329,6 +2383,7 @@ def ensure_businesses():
     CREATE TABLE IF NOT EXISTS coverage_log(id INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT, place TEXT, date TEXT, leads_found INTEGER, coverage_estimate INTEGER);
     CREATE TABLE IF NOT EXISTS business_review(id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, candidate_id INTEGER, name_key TEXT, reason TEXT, data TEXT, created TEXT, resolved TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS entity_profiles(entity_key TEXT PRIMARY KEY, tags TEXT, names TEXT, created TEXT, optional TEXT);
+    CREATE TABLE IF NOT EXISTS lead_feedback(id INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT, name TEXT, verdict TEXT, date TEXT);
     """)
     try:
         c.execute("ALTER TABLE entity_profiles ADD COLUMN optional TEXT")
@@ -2585,6 +2640,8 @@ def upsert_business(cid, rec):
     c = conn()
     try:
         kind, b, reason = find_match(c, rec)
+        if b and b.get("status") == "wrong":   # a wrong flag is never changed or re-linked by a search
+            return ("wrong", b["id"], "")
         if kind in ("phone", "website", "name"):
             merge_rec(c, b, rec)
             link_campaign(c, cid, b["id"], "merged")
@@ -2630,7 +2687,7 @@ def master_save(cid, ctx, name, url, snippet, phones, emails, biz):
            "src": src, "phone_src": biz.get("phone_src") or "", "today": now_day()}
     res = upsert_business(cid, rec)
     cnt = BIZ_COUNTS.setdefault(cid, {"new": 0, "merged": 0, "review": 0})
-    cnt[res[0]] += 1
+    cnt[res[0]] = cnt.get(res[0], 0) + 1
     return res
 
 def log_coverage(entity, place, found, pct):
@@ -2655,7 +2712,7 @@ def existing_for(entity, aliases):
     c = conn()
     rows = []
     for a in {x.lower() for x in aliases if x}:
-        rows += c.execute("SELECT id, category, last_seen FROM businesses WHERE lower(city)=? AND last_seen>=?", (a, cutoff)).fetchall()
+        rows += c.execute("SELECT id, category, last_seen FROM businesses WHERE lower(city)=? AND last_seen>=? AND status<>'wrong'", (a, cutoff)).fetchall()
     c.close()
     rows = [r for r in {r["id"]: r for r in rows}.values() if cat_match(entity, r["category"])]
     return [r["id"] for r in rows], max([r["last_seen"] for r in rows] or [""])
@@ -2700,8 +2757,87 @@ def campaign_prestart(cid):
     return redirect("/businesses?campaign=%d" % cid)
 
 # ---- (6) Businesses page
+def match_biz(rows, name, phones):
+    keys = {name_key_of(clean_name(name)), name_key_of(re.sub(r"\s+", " ", str(name or "")).strip()[:120])}
+    ph = {p10(x) for x in (phones or []) if p10(x)}
+    tk = tok(clean_name(name))
+    for r in rows:
+        if r["name_key"] in keys:
+            return r
+        try:
+            bp = {p10(p["n"]) for p in json.loads(r["phones"] or "[]")}
+        except Exception:
+            bp = set()
+        if ph & bp and tk & tok(r["name"] or ""):
+            return r
+    return None
+
+def wrong_match(name, phones):
+    try:
+        ensure_businesses()
+        c = conn()
+        rows = c.execute("SELECT id, name, name_key, phones FROM businesses WHERE status='wrong'").fetchall()
+        c.close()
+        return match_biz(rows, name, phones) is not None
+    except Exception:
+        return False
+
+def sync_leads_wrong(c):
+    rows = c.execute("SELECT id, name, name_key, phones FROM businesses WHERE status='wrong'").fetchall()
+    n = 0
+    for l in c.execute("SELECT id, title, phones FROM leads WHERE wrong=0").fetchall():
+        if match_biz(rows, l["title"] or "", [x for x in (l["phones"] or "").split(",") if x]):
+            c.execute("UPDATE leads SET wrong=1 WHERE id=?", (l["id"],))
+            n += 1
+    return n
+
+@app.route("/api/business/<int:bid>/verdict", methods=["POST"])
+def api_business_verdict(bid):
+    v = (request.get_json(force=True) or {}).get("verdict")
+    if v not in ("good", "wrong"):
+        return jsonify(ok=False, error="bad verdict"), 400
+    ensure_businesses()
+    c = conn()
+    b = c.execute("SELECT name, category FROM businesses WHERE id=?", (bid,)).fetchone()
+    if not b:
+        c.close()
+        return jsonify(ok=False, error="not found"), 404
+    if v == "wrong":
+        c.execute("UPDATE businesses SET status='wrong' WHERE id=?", (bid,))
+        sync_leads_wrong(c)
+    c.commit()
+    c.close()
+    add_feedback(b["category"], b["name"], v)
+    return jsonify(ok=True)
+
+@app.route("/api/lead/<int:lid>/verdict", methods=["POST"])
+def api_lead_verdict(lid):
+    v = (request.get_json(force=True) or {}).get("verdict")
+    if v not in ("good", "wrong"):
+        return jsonify(ok=False, error="bad verdict"), 400
+    ensure_businesses()
+    c = conn()
+    l = c.execute("SELECT l.title, l.phones, c.queries FROM leads l JOIN campaigns c ON c.id=l.campaign_id WHERE l.id=?", (lid,)).fetchone()
+    if not l:
+        c.close()
+        return jsonify(ok=False, error="not found"), 404
+    phones = [x for x in (l["phones"] or "").split(",") if x]
+    b = match_biz(c.execute("SELECT id, name, name_key, phones, category FROM businesses").fetchall(), l["title"] or "", phones)
+    entity = (b["category"] if b else "") or (l["queries"] or "").splitlines()[0].strip().lower()
+    if v == "wrong":
+        c.execute("UPDATE leads SET wrong=1 WHERE id=?", (lid,))
+        if b:
+            c.execute("UPDATE businesses SET status='wrong' WHERE id=?", (b["id"],))
+            sync_leads_wrong(c)
+    c.commit()
+    c.close()
+    add_feedback(entity, b["name"] if b else clean_name(l["title"] or ""), v)
+    return jsonify(ok=True)
+
 def biz_where(a):
     where, args = ["1=1"], []
+    if not a.get("show_wrong") and (a.get("status") or "").strip().lower() != "wrong":
+        where.append("status<>'wrong'")
     q = (a.get("q") or "").strip()
     if q:
         where.append("(name LIKE ? OR address LIKE ? OR phones LIKE ? OR emails LIKE ? OR website LIKE ? OR owner_notes LIKE ?)")
@@ -2764,7 +2900,7 @@ def businesses():
     opts = {col: [r[0] for r in c.execute("SELECT DISTINCT " + col + " FROM businesses WHERE " + col + "<>'' ORDER BY 1")] for col in ("category", "state", "city", "status")}
     review_n = c.execute("SELECT COUNT(*) FROM business_review WHERE resolved=''").fetchone()[0]
     c.close()
-    keys = ("q", "category", "state", "city", "status", "has", "min_score", "campaign", "sort")
+    keys = ("q", "category", "state", "city", "status", "has", "min_score", "campaign", "sort", "show_wrong")
     f = {k: a.get(k, "") for k in keys}
     qs = urllib.parse.urlencode({k: v for k, v in f.items() if v})
     return render_template_string(BIZ, rows=rows, total=total, page=page, pages=pages, opts=opts, f=f, qs=qs, review_n=review_n, bstatuses=BIZ_STATUSES)
@@ -2786,7 +2922,7 @@ def api_business(bid):
 def businesses_export():
     ensure_businesses()
     w, args = biz_where(request.args)
-    w += " AND do_not_contact=0 AND status<>'not interested' AND (phones<>'[]' OR emails<>'[]')"   # contactable leads only
+    w += " AND status<>'wrong' AND do_not_contact=0 AND status<>'not interested' AND (phones<>'[]' OR emails<>'[]')"   # contactable leads only
     c = conn()
     rows = [b_load(r) for r in c.execute("SELECT * FROM businesses WHERE " + w + " ORDER BY quality_score DESC, id", args)]
     c.close()
@@ -2845,6 +2981,7 @@ BIZ = HEAD + """
 <input name='min_score' type='number' min='0' max='100' value='{{f.min_score}}' placeholder='min score' style='margin:0;width:100px'>
 <select name='sort' style='margin:0;width:auto'><option value='score'>Sort: score</option><option value='name' {{'selected' if f.sort=='name'}}>name</option><option value='recent' {{'selected' if f.sort=='recent'}}>recently seen</option></select>
 <input type='hidden' name='campaign' value='{{f.campaign}}'>
+<label style='font-size:12px'><input type='checkbox' name='show_wrong' value='1' {{'checked' if f.show_wrong}} style='width:auto;margin:0 4px'>show wrong</label>
 <button>Filter</button> <a class='btn grey' href='/businesses/export.csv?{{qs}}'>Export contactable CSV</a>
 </form>
 {% if f.campaign %}<p><small>Showing businesses linked to campaign {{f.campaign}}. <a href='/businesses'>Show all</a></small></p>{% endif %}
@@ -2858,11 +2995,12 @@ BIZ = HEAD + """
 <td><select id='st{{b.id}}' onchange='saveB({{b.id}})' style='margin:0'>{% for s in bstatuses %}<option value='{{s}}' {{'selected' if b.status==s}}>{{s}}</option>{% endfor %}</select>
 <label style='font-size:12px'><input type='checkbox' id='dn{{b.id}}' {{'checked' if b.dnc}} onchange='saveB({{b.id}})' style='width:auto;margin:6px 4px 0 0'>do not contact</label></td>
 <td><input type='date' id='lc{{b.id}}' value='{{b.last_contacted}}' onchange='saveB({{b.id}})' style='margin:0 0 4px'><input id='nt{{b.id}}' value='{{b.owner_notes}}' placeholder='notes' onchange='saveB({{b.id}})' style='margin:0'></td>
-<td><small title='{{b.sources_txt}}'>{{b.nsrc}} source(s)<br>seen {{b.last_seen}}</small></td>
+<td><small title='{{b.sources_txt}}'>{{b.nsrc}} source(s)<br>seen {{b.last_seen}}</small><br>{% if b.status=='wrong' %}<b>wrong</b>{% else %}<button class='grey' onclick="verdictB({{b.id}},'good')" style='padding:2px 8px'>Good</button> <button onclick="verdictB({{b.id}},'wrong')" style='padding:2px 8px'>Wrong</button>{% endif %}</td>
 </tr>
 {% else %}<tr><td colspan='8'>No businesses match yet. They are added when a campaign saves leads.</td></tr>{% endfor %}</table>
 <p>Page {{page}} of {{pages}}{% if page>1 %} &middot; <a href='?{{qs}}&page={{page-1}}'>previous</a>{% endif %}{% if page<pages %} &middot; <a href='?{{qs}}&page={{page+1}}'>next</a>{% endif %}</p></div>
 <script>
+function verdictB(id,v){fetch('/api/business/'+id+'/verdict',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({verdict:v})}).then(function(){if(v=='wrong'){document.getElementById('st'+id).closest('tr').style.display='none';}});}
 function saveB(id){var g=function(p){return document.getElementById(p+id);};
 fetch('/api/business/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:g('st').value,owner_notes:g('nt').value,last_contacted:g('lc').value,do_not_contact:g('dn').checked?1:0})});}
 </script></main></body></html>"""
