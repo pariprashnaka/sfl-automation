@@ -82,7 +82,7 @@ def gemini_log(model, ok, usage=None, error=""):
     try:
         import sqlite3, time
         u = usage or {}
-        c = sqlite3.connect(r"D:aultutomation\leads\leads.db", timeout=30)
+        c = sqlite3.connect("D:/vault/automation/leads/leads.db", timeout=30)
         c.execute("CREATE TABLE IF NOT EXISTS gemini_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, model TEXT, ok INTEGER, prompt_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, total_tokens INTEGER, error TEXT)")
         c.execute("INSERT INTO gemini_calls(ts,day,kind,model,ok,prompt_tokens,output_tokens,thought_tokens,total_tokens,error) VALUES(?,?,?,?,?,?,?,?,?,?)",
                   (time.strftime("%Y-%m-%d %H:%M:%S"), time.strftime("%Y-%m-%d"), "digest", model, 1 if ok else 0,
@@ -116,9 +116,7 @@ def ask_gemini(prompt):
     return text
 
 def ask(prompt):
-    prompt = GROUND + "
-
-" + prompt
+    prompt = GROUND + "\n\n" + prompt
     text = ask_gemini(prompt)
     if text:
         return text
