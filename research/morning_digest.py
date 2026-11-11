@@ -207,7 +207,7 @@ class Seen(set):
     def add(self, k):
         set.add(self, k)
         self.raw[self.today] = sorted(self)
-        for d in sorted(self.raw)[:-10]:
+        for d in sorted(self.raw)[:-14]:
             self.raw.pop(d, None)
         try:
             HISTFILE.write_text(_json.dumps(self.raw), encoding="utf-8")

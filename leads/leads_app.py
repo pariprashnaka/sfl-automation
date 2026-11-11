@@ -194,9 +194,22 @@ BLOCK_EXTRA = ("justdial.com", "indiamart.com", "sulekha.com", "facebook.com", "
                "twitter.com", "x.com", "linkedin.com", "pinterest.com", "wikipedia.org", "quora.com", "reddit.com")
 LISTING = re.compile(r"\b(top|best|list|lists|directory|near me|nearby|address|contact|suppliers?|manufacturers?|dealers?|wholesalers?|exporters?|distributors?|stockists?|companies|shops|stores|\d{1,3}\+?\s+\w+)\b", re.I)
 NOISE = {"the", "and", "of", "pvt", "ltd", "private", "limited", "co"}
-ENTITY_TAGS = {"hospital": ["amenity=hospital", "amenity=clinic", "healthcare=hospital"],
+# words too common in business names to identify an entity; never used in the map name regex
+GENERIC_NAME_WORDS = {"care", "health", "healthcare", "cure", "medicare", "hospitality", "centre", "center", "store", "stores", "house", "shop", "shops",
+                      "mart", "point", "world", "new", "super", "global", "royal", "city", "service", "services", "enterprise", "enterprises",
+                      "traders", "trading", "agency", "group", "sons", "bhandar", "general", "national", "modern", "best", "prime", "life", "plus"}
+
+def distinctive_names(words):
+    out = []
+    for n in words:
+        n = str(n).strip()
+        if n and n.lower() not in GENERIC_NAME_WORDS and n.lower() not in [x.lower() for x in out]:
+            out.append(n)
+    return out
+
+ENTITY_TAGS = {"hospital": ["amenity=hospital", "healthcare=hospital"],
                "clinic": ["amenity=clinic", "amenity=doctors", "healthcare=clinic"],
-               "nursing": ["amenity=clinic", "amenity=hospital"],
+               "nursing": ["amenity=hospital"],
                "pharmacy": ["amenity=pharmacy"], "medical": ["amenity=pharmacy"],
                "lab": ["healthcare=laboratory"], "diagnostic": ["healthcare=laboratory", "healthcare=centre"],
                "school": ["amenity=school"], "college": ["amenity=college"], "bank": ["amenity=bank"],
@@ -281,22 +294,26 @@ def _plan_leads(cid, camp, term):
         terms.insert(0, entity)
     places = [str(x).strip() for x in (plan.get("places") or []) if str(x).strip()][:10]
     # map tags and name words: union of the cached AI profile, the planner's own tags and the hard-coded lists
-    prof_tags, prof_names = entity_profile(cid, entity)
+    prof_tags, prof_opt, prof_names = entity_profile(cid, entity)
     blob = (entity + " " + " ".join(terms)).lower()
-    raw = list(prof_tags) + [str(t).strip() for t in (plan.get("osm") or [])]
+    asked = term.lower()
+    # strict by default: only tags that mean the entity itself; sub-type tags only when the search text asks for them
+    raw = list(prof_tags)
+    for t in list(prof_opt) + [str(t).strip() for t in (plan.get("osm") or [])]:
+        v = t.split("=", 1)[-1].lower()
+        if len(v) >= 3 and re.search(r"" + re.escape(v[:3]), asked):
+            raw.append(t)
+    if not raw:
+        raw = [str(t).strip() for t in (plan.get("osm") or [])]
     for k, v in ENTITY_TAGS.items():
-        if k in blob:
+        if k in (entity.lower() + " " + asked):   # the entity and the user's own text, not the planner's sub-type terms
             raw += v
     tags = []
     for t in raw:
         if re.fullmatch(r"[a-z_:]+=[A-Za-z0-9_:]+", t) and tuple(t.split("=", 1)) not in tags:
             tags.append(tuple(t.split("=", 1)))
     aliases = [city] + [str(x).strip() for x in (plan.get("aliases") or []) if str(x).strip()][:3]
-    nm = []
-    for n in list(prof_names or []) + [w for k, v in ENTITY_NAMES.items() if k in blob for w in v.split("|")]:
-        n = str(n).strip()
-        if n and n.lower() not in [x.lower() for x in nm]:
-            nm.append(n)
+    nm = distinctive_names(list(prof_names or []) + [w for k, v in ENTITY_NAMES.items() if k in blob for w in v.split("|")])
     if nm:
         tags = tags[:5] + [("name~", "|".join(nm))]
     return city, entity, terms, places, tags[:6], aliases
@@ -487,6 +504,8 @@ def run_campaign(cid):
                 log(cid, "  map returned " + str(len(els)) + " places")
                 enrich = 0
                 found_phone = 0
+                phone_hits = 0
+                phone_skipped = 0
                 for el in els:
                     if total >= limit:
                         break
@@ -520,6 +539,10 @@ def run_campaign(cid):
                             phs, note, psrc = find_phones(cid, name, aliases)
                         except Exception:
                             phs, note, psrc = [], "", ""
+                        if phs:
+                            phone_hits += 1
+                    elif not phs:
+                        phone_skipped += 1
                     osm_url = "https://www.openstreetmap.org/" + str(el.get("type")) + "/" + str(el.get("id"))
                     ctr = el.get("center") or {}
                     save(name, site or osm_url,
@@ -529,6 +552,8 @@ def run_campaign(cid):
                               "phone_src": psrc if psrc else "", "website": site, "city_ok": True, "locality": tg.get("addr:suburb") or tg.get("addr:neighbourhood") or "",
                               "pincode": tg.get("addr:postcode") or "", "district": tg.get("addr:district") or "", "state": tg.get("addr:state") or "",
                               "tags": [k + "=" + tg[k] for k in ("shop", "amenity", "craft", "office", "healthcare", "tourism") if tg.get(k)]})
+
+                log(cid, "  Phone finder: %d lookups attempted (cap 25), %d found a phone, %d places had no phone and were skipped because of the cap" % (found_phone, phone_hits, phone_skipped))
 
             # ---- layer 2: web searches and directory pages
             parts_ = [x.strip() for x in camp["location"].split(",")]
@@ -2303,8 +2328,12 @@ def ensure_businesses():
     CREATE TABLE IF NOT EXISTS campaign_businesses(campaign_id INTEGER, business_id INTEGER, action TEXT, found_at TEXT, PRIMARY KEY(campaign_id, business_id));
     CREATE TABLE IF NOT EXISTS coverage_log(id INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT, place TEXT, date TEXT, leads_found INTEGER, coverage_estimate INTEGER);
     CREATE TABLE IF NOT EXISTS business_review(id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, candidate_id INTEGER, name_key TEXT, reason TEXT, data TEXT, created TEXT, resolved TEXT DEFAULT '');
-    CREATE TABLE IF NOT EXISTS entity_profiles(entity_key TEXT PRIMARY KEY, tags TEXT, names TEXT, created TEXT);
+    CREATE TABLE IF NOT EXISTS entity_profiles(entity_key TEXT PRIMARY KEY, tags TEXT, names TEXT, created TEXT, optional TEXT);
     """)
+    try:
+        c.execute("ALTER TABLE entity_profiles ADD COLUMN optional TEXT")
+    except sqlite3.OperationalError:
+        pass
     try:
         c.execute("ALTER TABLE campaigns ADD COLUMN prestart TEXT DEFAULT ''")
     except sqlite3.OperationalError:
@@ -2328,15 +2357,16 @@ def entity_profile(cid, entity):
     try:
         ensure_businesses()
         c = conn()
-        row = c.execute("SELECT tags, names FROM entity_profiles WHERE entity_key=?", (key,)).fetchone()
+        row = c.execute("SELECT tags, names, optional FROM entity_profiles WHERE entity_key=?", (key,)).fetchone()
         c.close()
-        if row:
-            return json.loads(row["tags"]), json.loads(row["names"])
+        if row and row["optional"] is not None:  # older rows (no strict/optional split) are regenerated
+            return json.loads(row["tags"]), json.loads(row["optional"]), json.loads(row["names"])
     except Exception:
         pass
-    prompt = ("For the kind of business below, output ONLY JSON like {\"osm\":[\"shop=houseware\"],\"names\":[\"word\"]}.\n"
-              "osm: up to 5 OpenStreetMap tags as key=value that places of this business type carry (shop=, amenity=, craft=, office=, healthcare=).\n"
-              "names: up to 10 words or short phrases that commonly appear inside the NAMES of such businesses in India, including Hindi and other "
+    prompt = ("For the kind of business below, output ONLY JSON like {\"strict_tags\":[\"shop=houseware\"],\"optional_tags\":[\"shop=other\"],\"names\":[\"word\"]}.\n"
+              "strict_tags: up to 4 OpenStreetMap tags as key=value (shop=, amenity=, craft=, office=, healthcare=) that mean the business type ITSELF and nothing else (for hospital: amenity=hospital, healthcare=hospital).\n"
+              "optional_tags: up to 4 tags of related sub-types or neighbouring kinds (for hospital: amenity=clinic, amenity=doctors, healthcare=laboratory, healthcare=physiotherapist); they are used only if the user's search text asks for that sub-type.\n"
+              "names: up to 10 DISTINCTIVE words or short phrases that appear inside the NAMES of this kind of business and would rarely appear in the names of other kinds of business (never generic words such as care, health, centre, store, house, shop, mart, point, services), including Hindi and other "
               "local-language words written in English letters (for example 'kirana' for grocery). Lowercase, no city names, "
               "and no generic words that would also match unrelated businesses.\n\nBusiness: " + entity)
     try:
@@ -2345,17 +2375,19 @@ def entity_profile(cid, entity):
         log(cid, "  map profile unavailable: " + str(ex)[:80])
         plan = None
     if not isinstance(plan, dict):
-        return [], []
-    tags = list(dict.fromkeys(str(t).strip() for t in (plan.get("osm") or []) if re.fullmatch(r"[a-z_:]+=[A-Za-z0-9_:]+", str(t).strip())))[:5]
+        return [], [], []
+    okt = lambda L: list(dict.fromkeys(str(t).strip() for t in (L or []) if re.fullmatch(r"[a-z_:]+=[A-Za-z0-9_:]+", str(t).strip())))
+    tags = okt(plan.get("strict_tags") or plan.get("osm"))[:4]
+    opt = [t for t in okt(plan.get("optional_tags"))[:4] if t not in tags]
     names = list(dict.fromkeys(str(n).strip().lower() for n in (plan.get("names") or []) if re.fullmatch(r"[A-Za-z0-9 ]{3,24}", str(n).strip())))[:10]
     if tags or names:
         c = conn()
-        c.execute("INSERT OR REPLACE INTO entity_profiles(entity_key,tags,names,created) VALUES(?,?,?,?)",
-                  (key, json.dumps(tags), json.dumps(names), time.strftime("%Y-%m-%d")))
+        c.execute("INSERT OR REPLACE INTO entity_profiles(entity_key,tags,names,created,optional) VALUES(?,?,?,?,?)",
+                  (key, json.dumps(tags), json.dumps(names), time.strftime("%Y-%m-%d"), json.dumps(opt)))
         c.commit()
         c.close()
-        log(cid, "  AI map profile for '" + entity + "': tags " + (", ".join(tags) or "none") + " | name words " + (", ".join(names) or "none"))
-    return tags, names
+        log(cid, "  AI map profile for '" + entity + "': strict tags " + (", ".join(tags) or "none") + " | optional " + (", ".join(opt) or "none") + " | name words " + (", ".join(names) or "none"))
+    return tags, opt, names
 
 # ---- (3) master list: normalising, matching, merging
 def now_day():
