@@ -2,6 +2,10 @@ import sqlite3, threading, re, time, csv, io, urllib.parse, pathlib, subprocess,
 import requests
 from flask import Flask, request, redirect, render_template_string, Response, jsonify
 from ddgs import DDGS
+import sys
+sys.path.insert(0, "D:/vault/automation")
+import ai_router
+from ai_router import ai, AIError
 
 BASE = pathlib.Path(r"D:\vault\automation\leads")
 BASE.mkdir(parents=True, exist_ok=True)
@@ -147,13 +151,11 @@ def category_page(title, d):
     # A directory category page is not one business: never save it as a lead (extraction from it is tried separately).
     return any(d == x or d.endswith("." + x) for x in AGG_DOMAINS) or bool(CATEGORY.search(title or ""))
 
-def ask(prompt):
+def ask(prompt, private=False, task="ask"):
     try:
-        r = requests.post(OLLAMA, json={"model": MODEL, "prompt": prompt, "stream": False,
-                                        "options": {"num_ctx": 2048}}, timeout=300)
-        return r.json()["response"].strip()
+        return ai(task, prompt, private=private)
     except Exception as e:
-        return "(Could not reach the local AI: " + str(e)[:80] + ")"
+        return "(Could not reach the AI: " + str(e)[:80] + ")"
 
 def draft(lead, camp):
     prompt = ("You write short first messages for a small Indian software company.\n"
@@ -165,7 +167,7 @@ def draft(lead, camp):
               "Write a polite WhatsApp message under 70 words. Greet them, say in one line what we offer and one benefit, "
               "and ask if they would like a 10-minute demo. No emojis, no pricing, and do not invent facts about their business. "
               "End with: Reply STOP and we will not message again.")
-    return ask(prompt)
+    return ask(prompt, task="draft")
 
 def short(term):
     if len(term.split()) <= 5:
@@ -285,7 +287,7 @@ def _plan_leads(cid, camp, term):
               "Requirement: " + term + "\nLocation: " + camp["location"])
     plan = None
     try:
-        plan = parse_json(ask_research(prompt, 2048), "{}")
+        plan = parse_json(ask_research(prompt, 2048, task="plan"), "{}")
     except Exception as ex:
         log(cid, "  planner unavailable: " + str(ex)[:80])
     if not isinstance(plan, dict):
@@ -398,7 +400,7 @@ def web(cid, q, home):
     return []
 
 def extract_businesses(entity, city, text):
-    size = 9000 if env_val("GEMINI_API_KEY") else 3500
+    size = 9000 if any(env_val(k) for k in ("GROQ_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY")) else 3500
     out = []
     for k in range(0, min(len(text), size * 3), size):
         p = ("Extract every distinct " + entity + " listed in the page text below that is located in or near " + city + ". "
@@ -406,7 +408,7 @@ def extract_businesses(entity, city, text):
              "Rules: copy names and phone numbers exactly as written; leave a field empty if it is not on the page; "
              "never invent anything; a business is a shop, company or dealer, so product names, categories and menu items are NOT businesses; ignore ads and items in other cities. If none, output [].\n\nPage text:\n" + text[k:k + size])
         try:
-            arr = parse_json(ask_research(p, 4096), "[]")
+            arr = parse_json(ask_research(p, 4096, task="extract"), "[]")
         except Exception:
             arr = None
         time.sleep(3)
@@ -469,7 +471,7 @@ def relevant(entity, title, body):
         ex = feedback_lines(entity)
         out = ask_research("Answer only YES or NO. Is this web page from a business that sells, makes or provides: " + entity +
                            "? " + (("Earlier decisions by the user for this kind of business: " + "; ".join(ex) + ". ") if ex else "") +
-                           "Page title: " + title[:120] + " | Description: " + body[:300], 1024)
+                           "Page title: " + title[:120] + " | Description: " + body[:300], 1024, task="relevant")
         return not out.strip().upper().startswith("NO")
     except Exception:
         return True
@@ -836,6 +838,7 @@ fillStates();
 </script></main></body></html>"""
 
 CAMP = HEAD + """
+<div style='display:flex;gap:8px;margin:0 0 16px;border-bottom:1px solid #e5e7eb'><a href='/campaign/{{c.id}}' style='padding:8px 16px;text-decoration:none;color:#2563eb;border-bottom:2px solid #2563eb;font-weight:600'>Leads</a><a href='/campaign/{{c.id}}/outreach' style='padding:8px 16px;text-decoration:none;color:#4b5563;font-weight:600'>Outreach</a></div>
 {% if pre.get('state')=='ask' %}<div class='card' style='border-left:4px solid #2563eb'>
 <h3>You already have {{pre.n}} businesses for this search.</h3>
 <p>Last updated {{pre.last}}. They are saved in your master list.</p>
@@ -1552,7 +1555,7 @@ def api_test_steps():
               "see <text that should appear on the page>\nwait <seconds>\nlogin\n\n"
               "Rules: use login on its own line when the user must sign in. Never type passwords. Maximum 12 lines. Output only the steps.\n"
               "Start URL: " + url + "\nDescription: " + (j.get("description") or "") + "\n\nSteps:")
-    return jsonify(steps=clean_steps(ask(prompt), url))
+    return jsonify(steps=clean_steps(ask(prompt, private=True, task="test_steps"), url))
 
 @app.route("/api/test/<int:tid>/run", methods=["POST"])
 def api_test_run(tid):
@@ -1701,79 +1704,10 @@ def env_val(k):
         pass
     return ""
 
-def ask_gemini(prompt, key):
-    models = []
-    for m in (env_val("GEMINI_MODEL"), "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"):
-        if m and m not in models:
-            models.append(m)
-    last = None
-    for m in models:
-        for n in range(2):
-            try:
-                return _ask_gemini_once(prompt, key, m)
-            except Exception as ex:
-                last = ex
-                time.sleep(5)
-    raise last
+ai_router.set_key_getter(env_val)
 
-def gemini_log(model, ok, usage=None, error="", kind="call"):
-    # Counts our own Gemini calls (never stores prompts, answers or keys). Must never break a call.
-    try:
-        u = usage or {}
-        c = conn()
-        c.execute("CREATE TABLE IF NOT EXISTS gemini_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, model TEXT, ok INTEGER, prompt_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, total_tokens INTEGER, error TEXT)")
-        c.execute("INSERT INTO gemini_calls(ts,day,kind,model,ok,prompt_tokens,output_tokens,thought_tokens,total_tokens,error) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (time.strftime("%Y-%m-%d %H:%M:%S"), time.strftime("%Y-%m-%d"), kind, model, 1 if ok else 0,
-                   int(u.get("promptTokenCount") or 0), int(u.get("candidatesTokenCount") or 0),
-                   int(u.get("thoughtsTokenCount") or 0), int(u.get("totalTokenCount") or 0), str(error)[:200]))
-        c.commit()
-        c.close()
-    except Exception:
-        pass
-
-def _ask_gemini_once(prompt, key, model=None):
-    model = model or env_val("GEMINI_MODEL") or "gemini-3.1-flash-lite"
-    try:
-        r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
-                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                          json={"contents": [{"parts": [{"text": prompt}]}],
-                                "generationConfig": {"temperature": 0.2}}, timeout=60)
-    except Exception as ex:
-        gemini_log(model, False, error="request failed: " + type(ex).__name__)
-        raise
-    try:
-        j = r.json()
-    except Exception:
-        gemini_log(model, False, error="unreadable reply HTTP " + str(r.status_code))
-        raise Exception("Gemini returned an unreadable reply (HTTP " + str(r.status_code) + ")")
-    if "error" in j:
-        msg = str(j["error"].get("message", j["error"]))[:250]
-        gemini_log(model, False, j.get("usageMetadata"), "HTTP " + str(r.status_code) + " " + msg)
-        raise Exception("Gemini error: " + msg)
-    try:
-        text = j["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        gemini_log(model, False, j.get("usageMetadata"), "no answer in reply")
-        raise Exception("Gemini gave no answer: " + str(j)[:250])
-    gemini_log(model, True, j.get("usageMetadata"))
-    return text
-
-def _ask_research_raw(prompt, ctx=4096):
-    key = env_val("GEMINI_API_KEY")
-    if key:
-        try:
-            return ask_gemini(prompt, key)
-        except Exception:
-            gemini_log("", False, error="all Gemini models failed; used local model " + MODEL, kind="fallback")
-    r = requests.post(OLLAMA, json={"model": MODEL, "prompt": prompt, "stream": False,
-                                    "options": {"num_ctx": ctx, "temperature": 0.2}}, timeout=900)
-    try:
-        j = r.json()
-    except Exception:
-        raise Exception("Local AI returned an unreadable reply (HTTP " + str(r.status_code) + ")")
-    if "response" not in j:
-        raise Exception("Local AI error: " + str(j.get("error", j))[:200])
-    return j["response"].strip()
+def _ask_research_raw(prompt, ctx=4096, private=False, task="research"):
+    return ai(task, prompt, private=private, ctx=ctx)
 
 GROUND = ("STRICT RULES: Use only facts stated in the sources given. Never guess, estimate, infer, predict, calculate "
           "or add outside knowledge. Copy numbers, names and dates exactly. If something is not in the sources, write: Not found in these sources.")
@@ -1803,13 +1737,13 @@ def verify_answer(answer, prompt):
         out.append(line + ("  \u26a0 unverified figure: " + ", ".join(bad[:3]) if bad else ""))
     return "\n".join(out)
 
-def ask_research(prompt, ctx=4096):
+def ask_research(prompt, ctx=4096, private=False, task="research"):
     strict = "Sources:" in prompt
-    out = _ask_research_raw((GROUND + "\n\n" + prompt) if strict else prompt, ctx)
+    out = _ask_research_raw((GROUND + "\n\n" + prompt) if strict else prompt, ctx, private, task)
     return verify_answer(out, prompt) if strict else out
 
 def plan_queries(q):
-    out = ask("Write 3 different web search queries (3 to 7 words each) to research this question. One per line, no numbering, no quotes.\n\nQuestion: " + q)
+    out = ask("Write 3 different web search queries (3 to 7 words each) to research this question. One per line, no numbering, no quotes.\n\nQuestion: " + q, private=True, task="research_plan")
     qs = []
     for ln in out.splitlines():
         ln = re.sub(r"^[\s\-\*\d\.\)]+", "", ln).strip().strip(chr(34)).strip(chr(39))
@@ -1900,7 +1834,7 @@ def run_research(rid):
                   "- Write 5 to 8 short bullet points, then one last line starting with Confidence: (high, medium or low) and why.\n\n"
                   "Question: " + q + "\n\nSources:\n" + block + "\n\nAnswer:")
         rlog(rid, "Asking the local AI to write the answer from " + str(len(sources)) + " sources (this can take a few minutes)...")
-        answer = ask_research(prompt)
+        answer = ask_research(prompt, private=True, task="research_answer")
         status = "done"
         rlog(rid, "Done.")
     except Exception as ex:
@@ -1936,7 +1870,7 @@ def rewrite_answer(rid):
         with LOCK:
             RES_LOGS[rid] = []
         rlog(rid, "Asking the local AI again with a smaller input (this can take a few minutes)...")
-        answer = ask_research(build_prompt(row["question"], sources), 3072)
+        answer = ask_research(build_prompt(row["question"], sources), 3072, private=True, task="research_answer")
         status = "done"
         rlog(rid, "Done.")
     except Exception as ex:
@@ -2310,21 +2244,55 @@ def gemini_usage(days=14):
     try:
         c = conn()
         c.execute("CREATE TABLE IF NOT EXISTS gemini_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, model TEXT, ok INTEGER, prompt_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, total_tokens INTEGER, error TEXT)")
+        if "provider" not in [r[1] for r in c.execute("PRAGMA table_info(gemini_calls)")]:
+            c.execute("ALTER TABLE gemini_calls ADD COLUMN provider TEXT")
+            c.commit()
         rows = c.execute("SELECT day, SUM(kind='call') AS calls, SUM(kind='call' AND ok=1) AS ok, SUM(kind='call' AND ok=0) AS bad, "
                          "SUM(CASE WHEN kind='call' THEN prompt_tokens ELSE 0 END) AS pt, SUM(CASE WHEN kind='call' THEN output_tokens ELSE 0 END) AS ot, "
                          "SUM(CASE WHEN kind='call' THEN thought_tokens ELSE 0 END) AS tt, SUM(CASE WHEN kind='call' THEN total_tokens ELSE 0 END) AS tot, "
-                         "SUM(kind='fallback') AS fb FROM gemini_calls WHERE day>=? GROUP BY day ORDER BY day DESC", (since,)).fetchall()
-        models = c.execute("SELECT model, COUNT(*) AS n, SUM(ok) AS ok FROM gemini_calls WHERE kind='call' AND day>=? GROUP BY model ORDER BY n DESC", (since,)).fetchall()
-        last_err = c.execute("SELECT ts, model, error FROM gemini_calls WHERE kind='call' AND ok=0 ORDER BY id DESC LIMIT 1").fetchone()
+                         "SUM(kind='fallback') AS fb FROM gemini_calls WHERE day>=? AND (kind='fallback' OR COALESCE(provider,'gemini')='gemini') GROUP BY day ORDER BY day DESC", (since,)).fetchall()
+        models = c.execute("SELECT model, COUNT(*) AS n, SUM(ok) AS ok FROM gemini_calls WHERE kind='call' AND COALESCE(provider,'gemini')='gemini' AND day>=? GROUP BY model ORDER BY n DESC", (since,)).fetchall()
+        last_err = c.execute("SELECT ts, model, error FROM gemini_calls WHERE kind='call' AND COALESCE(provider,'gemini')='gemini' AND ok=0 ORDER BY id DESC LIMIT 1").fetchone()
         c.close()
         return rows, models, last_err
     except Exception:
         return [], [], None
 
+def ai_usage():
+    # Per provider, today: calls, successes, failures, cool-down state; plus cloud-versus-local share of answered calls.
+    today = time.strftime("%Y-%m-%d")
+    st = ai_router.status()
+    out = []
+    cloud = local = 0
+    try:
+        c = conn()
+        for p in ("groq", "gemini", "openrouter", "ollama"):
+            r = c.execute("SELECT COUNT(*) n, COALESCE(SUM(ok),0) ok FROM gemini_calls WHERE day=? AND kind IN ('call','digest') AND COALESCE(provider,'gemini')=?", (today, p)).fetchone()
+            s = st[p]
+            if p == "ollama":
+                state = "local, always available"
+            elif not s["key"]:
+                state = "no key (skipped)"
+            else:
+                bits = ["cooling %s (%d min left)" % (n, m) for n, m in s["cool"]] + ["retired today: " + n for n in s["disabled"]]
+                state = "; ".join(bits) if bits else "ready"
+            out.append({"p": p, "n": r["n"], "ok": r["ok"], "bad": r["n"] - r["ok"], "state": state})
+            if p == "ollama":
+                local += r["ok"]
+            else:
+                cloud += r["ok"]
+        c.close()
+    except Exception:
+        pass
+    tot = cloud + local
+    share = ("cloud %d%% / local %d%% (%d answers today)" % (round(100 * cloud / tot), round(100 * local / tot), tot)) if tot else "no answers yet today"
+    return out, share
+
 @app.route("/system")
 def system():
     day_rows, proj_rows, files, errors = claude_usage(14)
     g_rows, g_models, g_err = gemini_usage(14)
+    ai_rows, ai_share = ai_usage()
     tot = [sum(r[1][i] for r in day_rows) for i in range(5)]
     g_tot = {k: sum((r[k] or 0) for r in g_rows) for k in ("calls", "ok", "bad", "pt", "ot", "tt", "tot", "fb")}
     ensure_businesses()
@@ -2334,7 +2302,7 @@ def system():
     e_row = c.execute("SELECT COUNT(*) n, COALESCE(SUM(examined),0) ex, COALESCE(SUM(updated),0) up, COALESCE(SUM(phones_added),0) pa, COALESCE(SUM(emails_added),0) ea FROM enrich_log WHERE ts>=?", (since,)).fetchone()
     c.close()
     return render_template_string(SYS, q_rows=q_rows, e_row=e_row, day_rows=day_rows, proj_rows=proj_rows, files=files, errors=errors, tot=tot,
-                                  g_rows=g_rows, g_models=g_models, g_err=g_err, g_tot=g_tot, model=MODEL)
+                                  g_rows=g_rows, g_models=g_models, g_err=g_err, g_tot=g_tot, model=MODEL, ai_rows=ai_rows, ai_share=ai_share)
 
 SYS = HEAD + """
 <h2>System</h2>
@@ -2355,6 +2323,12 @@ SYS = HEAD + """
 {% for q in q_rows %}<tr><td>{{q.entity}} in {{q.place}}</td><td>{{q.status}}{% if q.note %} <small>({{q.note}})</small>{% endif %}</td><td>{{q.last_run}}</td><td>{{q.mode}}</td><td>{{q.leads_found}}</td><td>{{q.enriched}}</td></tr>
 {% else %}<tr><td colspan='6'>No queue items ran in the last 24 hours.</td></tr>{% endfor %}</table>
 <p><small>Website enrichment in this period: {{e_row.n}} run(s), {{e_row.ex}} business(es) scanned, {{e_row.up}} gained contacts ({{e_row.pa}} phone(s), {{e_row.ea}} email(s)).</small></p></div>
+
+<div class='card'><h3>AI providers today</h3>
+<p><small>Order: Groq, Gemini, OpenRouter, then local. Research and notes stay local. Cool-down state is for this app's process (the digest keeps its own). Both the app and the digest are counted in the numbers.</small></p>
+<table><tr><th>Provider</th><th>Calls today</th><th>Successes</th><th>Failures</th><th>Status</th></tr>
+{% for a in ai_rows %}<tr><td>{{a.p}}</td><td>{{a.n}}</td><td>{{a.ok}}</td><td>{{a.bad}}</td><td>{{a.state}}</td></tr>{% endfor %}</table>
+<p style='margin-top:8px'>Share of answers: <b>{{ai_share}}</b></p></div>
 
 <div class='card'><h3>Usage: this app's Gemini calls, last 14 days</h3>
 <p><small>Counted by this app since logging was added (earlier calls are not included). Each row counts every API attempt; failed attempts may lack token counts. Calls made by the separate morning-digest script are not included.</small></p>
@@ -2452,7 +2426,7 @@ def entity_profile(cid, entity):
               "local-language words written in English letters (for example 'kirana' for grocery). Lowercase, no city names, "
               "and no generic words that would also match unrelated businesses.\n\nBusiness: " + entity)
     try:
-        plan = parse_json(ask_research(prompt, 1024), "{}")
+        plan = parse_json(ask_research(prompt, 1024, task="profile"), "{}")
     except Exception as ex:
         log(cid, "  map profile unavailable: " + str(ex)[:80])
         plan = None
@@ -3345,6 +3319,9 @@ QUEUE = HEAD + """
 {% if q.status in ('pending','paused') %}<form method='post' action='/queue/{{q.id}}/pause' style='display:inline'><button class='grey' style='padding:2px 8px'>{{'Resume' if q.status=='paused' else 'Pause'}}</button></form>{% endif %}
 <form method='post' action='/queue/{{q.id}}/delete' style='display:inline'><button class='grey' style='padding:2px 8px' {{'disabled' if q.status=='running'}}>Delete</button></form></td></tr>
 {% else %}<tr><td colspan='11'>Queue is empty.</td></tr>{% endfor %}</table></div></main></body></html>"""
+
+import outreach
+outreach.register(sys.modules[__name__])
 
 if __name__ == "__main__":
     import sys

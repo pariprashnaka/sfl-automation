@@ -5,6 +5,9 @@ from googlenewsdecoder import gnewsdecoder
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
+import sys
+sys.path.insert(0, r"D:\vault\automation")
+from ai_router import ai
 
 load_dotenv(r"D:\vault\automation\.env")
 
@@ -77,53 +80,10 @@ def tier_of(src):
     return 0
 
 GROUND = "Facts, figures, names and dates must come only from the text given; never invent them. You may explain how a story could affect India, but begin every such sentence with 'Possible India impact:' so it is clearly analysis, not a reported fact."
-def gemini_log(model, ok, usage=None, error=""):
-    # Counts digest Gemini calls in leads.db gemini_calls (kind "digest"); never stores prompts, answers or keys. Must never break the digest.
-    try:
-        import sqlite3, time
-        u = usage or {}
-        c = sqlite3.connect("D:/vault/automation/leads/leads.db", timeout=30)
-        c.execute("CREATE TABLE IF NOT EXISTS gemini_calls(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, day TEXT, kind TEXT, model TEXT, ok INTEGER, prompt_tokens INTEGER, output_tokens INTEGER, thought_tokens INTEGER, total_tokens INTEGER, error TEXT)")
-        c.execute("INSERT INTO gemini_calls(ts,day,kind,model,ok,prompt_tokens,output_tokens,thought_tokens,total_tokens,error) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (time.strftime("%Y-%m-%d %H:%M:%S"), time.strftime("%Y-%m-%d"), "digest", model, 1 if ok else 0,
-                   int(u.get("promptTokenCount") or 0), int(u.get("candidatesTokenCount") or 0),
-                   int(u.get("thoughtsTokenCount") or 0), int(u.get("totalTokenCount") or 0), str(error)[:200]))
-        c.commit()
-        c.close()
-    except Exception:
-        pass
-
-def ask_gemini(prompt):
-    # key comes from the environment (load_dotenv above); .env is never opened directly
-    key = os.environ.get("GEMINI_API_KEY", "")
-    if not key:
-        return ""
-    model = os.environ.get("GEMINI_MODEL") or "gemini-3.1-flash-lite"
-    try:
-        r = requests.post("https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent",
-                          headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                          json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}, timeout=60)
-        j = r.json()
-    except Exception as ex:
-        gemini_log(model, False, error="request failed: " + type(ex).__name__)
-        return ""
-    try:
-        text = j["candidates"][0]["content"]["parts"][0]["text"].strip()
-    except Exception:
-        gemini_log(model, False, j.get("usageMetadata") if isinstance(j, dict) else None, "HTTP " + str(r.status_code) + " no answer")
-        return ""
-    gemini_log(model, True, j.get("usageMetadata"))
-    return text
-
 def ask(prompt):
-    prompt = GROUND + "\n\n" + prompt
-    text = ask_gemini(prompt)
-    if text:
-        return text
+    # Multi-provider router (groq, gemini, openrouter, local last); digest text is public news, so cloud is allowed.
     try:
-        r = requests.post(OLLAMA, json={"model": MODEL, "prompt": prompt, "stream": False,
-                                        "options": {"num_ctx": 3072}}, timeout=600)
-        return r.json()["response"].strip()
+        return ai("digest", GROUND + "\n\n" + prompt, ctx=3072)
     except Exception:
         return ""
 
