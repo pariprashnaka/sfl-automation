@@ -773,7 +773,7 @@ class ImageGen(unittest.TestCase):
         self.assertEqual((r["file"], r["provider"]), (None, "svg"))
         self.assertIn("CF_ACCOUNT_ID", r["reason"])
         self.env.update(saved)
-        self.settings["mkt_img_cap_cloudflare"] = 0                       # quota hit
+        self.settings["mkt_neuron_cap"] = 0                                # quota hit
         r = self.gen()
         self.assertEqual(r["provider"], "svg")
         self.assertIn("daily limit", r["reason"])
@@ -1070,8 +1070,8 @@ class Screenshots(unittest.TestCase):
         self.assertGreater(z.TXT[1], pic_bottom)                                                                # text zone starts below the picture
         self.assertGreater(z.TXT[1] + z.TXT[3], z.TXT[1])
         self.assertLessEqual(z.TXT[1] + z.TXT[3], z.FOOT[1])                                                    # footer strip is its own band
-        self.assertLessEqual(z.HEAD[1] + z.HEAD[3], z.PIC[1])
-        self.assertTrue(0.5 <= z.PIC[3] / z.H <= 0.55)
+        self.assertEqual((z.PIC[0], z.PIC[1], z.PIC[2], z.PIC[3]), (0, 0, 1080, 760))                         # picture box on top, full width
+        self.assertEqual(z.TXT[1], z.PIC[3] + 24)
         self.assertLess(z.TXT[1] + z.TAIL, z.TXT[1] + z.TXT[3])
         for nb, cap, cta in ((0, False, True), (1, True, False), (2, False, False), (2, True, True)):
             b = z.budgets(nb, cap, cta)
@@ -1129,6 +1129,235 @@ class Screenshots(unittest.TestCase):
         self.assertEqual(len(files), 4)
         for f in files:
             self.assertEqual(Image.open(f).size, (1080, 1350))
+
+
+class CharacterLibrary(unittest.TestCase):
+    """Reference-image calls (mocked), neuron budget and the queue at the cap, character library endpoints, picture-box rules."""
+    PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 2000
+
+    def setUp(self):
+        from marketing import imagegen, characters, story_routes as sr
+        self.ig, self.ch, self.sr = imagegen, characters, sr
+        self.tmp = tempfile.mkdtemp()
+        self.old = (mdb.ASSETS, mdb.OUT_ROOT, imagegen.CACHE_DIR, imagegen.http_post, imagegen.http_post_multipart, imagegen.SLEEP, sr.ai)
+        mdb.ASSETS = pathlib.Path(self.tmp) / "assets"
+        mdb.OUT_ROOT = pathlib.Path(self.tmp) / "out"
+        imagegen.CACHE_DIR = pathlib.Path(self.tmp) / "cache"
+        imagegen.SLEEP = lambda s: None
+        self.m = make_app(self.tmp)
+        self.m.env_val = lambda k: {"CF_ACCOUNT_ID": "acc1", "CF_API_TOKEN": "tok1"}.get(k, "")
+        self.cl = self.m.app.test_client()
+        self.calls = []
+        c = self.m.conn()
+        mdb.ensure(c)
+        c.close()
+
+    def tearDown(self):
+        (mdb.ASSETS, mdb.OUT_ROOT, self.ig.CACHE_DIR, self.ig.http_post, self.ig.http_post_multipart, self.ig.SLEEP, self.sr.ai) = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def b64(self):
+        import base64
+        return base64.b64encode(self.PNG).decode()
+
+    def masters(self, n=2):
+        d = pathlib.Path(self.tmp) / "m"
+        d.mkdir(exist_ok=True)
+        out = []
+        for k in range(n):
+            f = d / ("m%d.png" % k)
+            Image.new("RGB", (64, 64), (k * 80, 50, 90)).save(f)
+            out.append(f)
+        return out
+
+    def conn(self):
+        return self.m.conn
+
+    def cast(self, with_master=True):
+        mm = self.masters(2) if with_master else [None, None]
+        return [dict(role="shopkeeper", name="Ramesh", description="d1", seed=1, master=str(mm[0]) if mm[0] else None),
+                dict(role="customer", name="Meena", description="d2", seed=2, master=str(mm[1]) if mm[1] else None)]
+
+    def slide(self, two=True):
+        ch = [{"role": "shopkeeper", "expression": "happy", "position": "left"}] + ([{"role": "customer", "expression": "worried", "position": "right"}] if two else [])
+        return cartoon.clean_slide({"description": "Shopkeeper2 shows a tablet to Customer", "characters": ch, "scene": "shop_counter"})
+
+    def settings(self):
+        return lambda k, d: self.m.settings.get(k, d)
+
+    # ---- Job C: reference call ----
+    def test_klein_multipart_call_and_prompt(self):
+        def post(url, headers, fields, files):
+            self.calls.append((url, headers, fields, files))
+            return {"result": {"image": self.b64()}}
+        self.ig.http_post_multipart = post
+        prompt, masters = self.ig.ref_scene_prompt(self.slide(), self.cast(), cartoon.SCENES)
+        self.assertEqual(len(masters), 2)
+        self.assertTrue(prompt.startswith("The first person is the same as in reference image 1"))
+        one, m1 = self.ig.ref_scene_prompt(self.slide(False), self.cast(), cartoon.SCENES)
+        self.assertTrue(one.startswith("Same person as in the reference image, same face, hair, clothes."))
+        self.assertEqual(len(m1), 1)
+        for text in (prompt, one):
+            for w in ("blank signboards", "no readable text", "no letters", "no logos", "70 percent", "Medium shot"):
+                self.assertIn(w, text)
+            self.assertNotIn("Shopkeeper2", text)
+        r = self.ig.generate_refs(prompt, masters, self.m.env_val, self.conn(), self.settings())
+        self.assertEqual(r["provider"], "cloudflare-ref")
+        url, hdr, fields, files = self.calls[0]
+        self.assertEqual(url, "https://api.cloudflare.com/client/v4/accounts/acc1/ai/run/@cf/black-forest-labs/flux-2-klein-4b")
+        self.assertEqual(hdr["Authorization"], "Bearer tok1")
+        self.assertEqual(sorted(files), ["input_image_0", "input_image_1"])                 # first character = input_image_0
+        self.assertEqual(files["input_image_0"], pathlib.Path(masters[0]).read_bytes())
+        self.assertEqual((fields["width"], fields["height"], fields["prompt"]), (str(self.ig.SCENE_W), str(self.ig.SCENE_H), prompt))
+        self.assertAlmostEqual(self.ig.SCENE_W / self.ig.SCENE_H, 1080 / 760, delta=0.03)   # generated at picture-box proportions
+        self.assertEqual(self.ig.SCENE_W % 16 + self.ig.SCENE_H % 16, 0)
+        again = self.ig.generate_refs(prompt, masters, self.m.env_val, self.conn(), self.settings())
+        self.assertTrue(again["cached"])
+        self.assertEqual(len(self.calls), 1)
+
+    def test_neuron_budget_images_left_and_queue_at_cap(self):
+        self.ig.http_post_multipart = lambda *a: {"result": {"image": self.b64()}}
+        c = self.m.conn()
+        self.assertEqual(self.ig.images_left(c, self.settings()), 10000 // 125)
+        c.close()
+        prompt, masters = self.ig.ref_scene_prompt(self.slide(), self.cast(), cartoon.SCENES)
+        self.assertTrue(self.ig.generate_refs(prompt, masters, self.m.env_val, self.conn(), self.settings())["file"])
+        c = self.m.conn()
+        self.assertEqual(self.ig.neurons_today(c), self.ig.neurons_for("klein", 2))
+        self.assertLess(self.ig.images_left(c, self.settings()), 10000 // 125)
+        c.close()
+        self.m.settings["mkt_neuron_cap"] = 50                                              # budget used up
+        p2 = prompt + " other"
+        r = self.ig.generate_refs(p2, masters, self.m.env_val, self.conn(), self.settings())
+        self.assertTrue(r.get("queued"))
+        self.assertIn("queued for tomorrow", r["reason"])
+        r = self.ig.generate_refs(p2, masters, self.m.env_val, self.conn(), self.settings())      # no duplicate queue rows
+        c = self.m.conn()
+        self.assertEqual(self.ig.queued_count(c), 1)
+        c.close()
+        self.assertEqual(self.ig.drain_queue(self.m.env_val, self.conn(), self.settings()), 0)    # still no budget
+        self.m.settings["mkt_neuron_cap"] = 10000                                           # "tomorrow"
+        c = self.m.conn()
+        c.execute("DELETE FROM imagegen_usage")
+        c.commit()
+        c.close()
+        self.assertEqual(self.ig.drain_queue(self.m.env_val, self.conn(), self.settings()), 1)
+        c = self.m.conn()
+        self.assertEqual(self.ig.queued_count(c), 0)
+        c.close()
+        self.assertTrue(self.ig.generate_refs(p2, masters, self.m.env_val, self.conn(), self.settings())["cached"])   # next render is free
+        h = self.cl.get("/marketing").get_data(as_text=True)
+        self.assertIn("Images left today", h)
+
+    def test_scene_chain_order_masters_then_text_then_svg(self):
+        self.ig.http_post_multipart = lambda *a: {"result": {"image": self.b64()}}
+        self.ig.http_post = lambda *a: {"result": {"image": self.b64()}}
+        r = self.ig.scene_chain(self.slide(), self.cast(), cartoon.SCENES, False, self.m.env_val, self.conn(), self.settings())
+        self.assertEqual(r["provider"], "cloudflare-ref")
+        r = self.ig.scene_chain(self.slide(), self.cast(False), cartoon.SCENES, False, self.m.env_val, self.conn(), self.settings())      # no masters: text-only schnell
+        self.assertEqual(r["provider"], "cloudflare")
+        self.assertIn("master", r["note"])
+        r = self.ig.scene_chain(self.slide(), self.cast(), cartoon.SCENES, False, self.m.env_val, self.conn(), self.settings(), off=True)
+        self.assertEqual(r["provider"], "svg")
+        def boom(*a):
+            raise self.ig.ImageError("HTTP 403: no")
+        self.ig.http_post_multipart, self.ig.http_post = boom, boom
+        other = self.slide()
+        other["description"] = "a different scene that was never cached"
+        r = self.ig.scene_chain(other, self.cast(), cartoon.SCENES, False, self.m.env_val, self.conn(), self.settings())
+        self.assertEqual((r["file"], r["provider"]), (None, "svg"))
+
+    # ---- Job C: library ----
+    def test_defaults_seeded_and_mapped_to_roles(self):
+        c = self.m.conn()
+        names = [r[0] for r in c.execute("SELECT name FROM characters ORDER BY id")]
+        self.assertEqual(names[:3], ["Ramesh", "Sunil", "Meena"])
+        rows = c.execute("SELECT m.role, ch.name FROM cast_members m JOIN characters ch ON ch.id=m.char_id").fetchall()
+        c.close()
+        self.assertEqual({r[0]: r[1] for r in rows}, {"shopkeeper": "Ramesh", "shopkeeper2": "Sunil", "customer": "Meena"})
+        h = self.cl.get("/marketing/characters").get_data(as_text=True)
+        for w in ("Ramesh", "Sunil", "Meena", "Make 3 candidates", "Propose characters", "no master yet"):
+            self.assertIn(w, h)
+        c = self.m.conn()
+        brand = c.execute("SELECT * FROM brands LIMIT 1").fetchone()
+        c.close()
+        cast = self.sr._cast(brand)
+        self.assertTrue(all(x["master"] is None for x in cast))
+
+    def wait(self, jid):
+        for _ in range(100):
+            j = self.sr.JOBS[jid]
+            if j["state"] != "running":
+                return j
+            _time.sleep(0.1)
+        self.fail("job did not finish")
+
+    def test_candidates_pick_lock_master_and_slides_use_it(self):
+        self.ig.http_post = lambda url, h, p: {"result": {"image": __import__("base64").b64encode(self.png_big()).decode()}}
+        r = self.cl.post("/api/marketing/characters/1/candidates", json={"round": 1}).get_json()
+        j = self.wait(r["job"])
+        self.assertEqual(j["state"], "done", j["error"])
+        cands = j["result"]["candidates"]
+        self.assertEqual(len(cands), 3)
+        prompts = set()
+        self.assertTrue(all(self.ig.safe_name(c["name"]) for c in cands))
+        self.assertEqual(self.cl.get(cands[0]["url"]).status_code, 200)
+        self.assertFalse(self.cl.post("/api/marketing/characters/1/pick", json={"name": "../../x.png"}).get_json()["ok"])
+        self.assertTrue(self.cl.post("/api/marketing/characters/1/pick", json={"name": cands[1]["name"]}).get_json()["ok"])
+        self.assertEqual(self.cl.get("/marketing/char/1").status_code, 200)
+        self.assertTrue((mdb.ASSETS / "characters" / "1.png").is_file())
+        self.assertLessEqual(max(Image.open(mdb.ASSETS / "characters" / "1.png").size), 1024)
+        c = self.m.conn()
+        brand = c.execute("SELECT * FROM brands LIMIT 1").fetchone()
+        c.close()
+        cast = {x["role"]: x for x in self.sr._cast(brand)}
+        self.assertTrue(cast["shopkeeper"]["master"])                                        # locked master is what slides pass as reference
+        self.assertIsNone(cast["customer"]["master"])
+
+    def png_big(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (1400, 1400), (120, 80, 60)).save(buf, "PNG")
+        return buf.getvalue()
+
+    def test_manage_characters_create_rename_upload_delete(self):
+        r = self.cl.post("/api/marketing/characters", json={"name": "Lakshmi", "description": "elderly woman, silver hair, green saree"}).get_json()
+        self.assertTrue(r["ok"])
+        cid = r["id"]
+        self.assertFalse(self.cl.post("/api/marketing/characters", json={"name": "", "description": "x"}).get_json()["ok"])
+        self.assertTrue(self.cl.put("/api/marketing/characters/%d" % cid, json={"name": "Lakshmi ji", "description": "elderly woman"}).get_json()["ok"])
+        up = self.cl.post("/api/marketing/characters/%d/master" % cid, data={"file": (io.BytesIO(self.png_big()), "m.png")}, content_type="multipart/form-data").get_json()
+        self.assertTrue(up["ok"], up)
+        self.assertFalse(self.cl.post("/api/marketing/characters/%d/master" % cid, data={"file": (io.BytesIO(b"nope"), "m.png")}, content_type="multipart/form-data").get_json()["ok"])
+        self.assertIn("Lakshmi ji", self.cl.get("/marketing/characters").get_data(as_text=True))
+        f = mdb.ASSETS / "characters" / ("%d.png" % cid)
+        self.assertTrue(f.is_file())
+        c = self.m.conn()
+        c.execute("UPDATE cast_members SET char_id=? WHERE role='customer'", (cid,))
+        c.commit()
+        c.close()
+        self.assertTrue(self.cl.delete("/api/marketing/characters/%d" % cid).get_json()["ok"])
+        self.assertFalse(f.exists())
+        c = self.m.conn()
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM cast_members WHERE char_id=?", (cid,)).fetchone()[0], 0)
+        c.close()
+
+    def test_propose_characters_from_brief_mocked_ai(self):
+        self.sr.ai = lambda task, prompt, **k: json.dumps({"characters": [{"name": "Gopal", "description": "young tea seller, thin, cap"}, {"name": "", "description": "x"},
+                                                                          {"name": "Asha", "description": "middle-aged tailor, glasses"}]})
+        r = self.cl.post("/api/marketing/characters/propose", json={"brief": "do dukaan wale"}).get_json()
+        j = self.wait(r["job"])
+        self.assertEqual([x["name"] for x in j["result"]["characters"]], ["Gopal", "Asha"])
+        self.assertFalse(self.cl.post("/api/marketing/characters/propose", json={"brief": " "}).get_json()["ok"])
+
+    def test_brand_kit_picks_library_character_per_role(self):
+        c = self.m.conn()
+        bid = c.execute("SELECT id FROM brands LIMIT 1").fetchone()[0]
+        c.close()
+        self.assertIn("char_customer", self.cl.get("/marketing/brands").get_data(as_text=True))
+        self.cl.post("/marketing/cast/%d" % bid, data={"char_customer": "1"})
+        c = self.m.conn()
+        self.assertEqual(c.execute("SELECT char_id FROM cast_members WHERE brand_id=? AND role='customer'", (bid,)).fetchone()[0], 1)
+        c.close()
 
 
 if __name__ == "__main__":

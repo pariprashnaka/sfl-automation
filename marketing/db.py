@@ -15,13 +15,18 @@ CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id 
   type TEXT DEFAULT 'post', topic TEXT DEFAULT '', caption TEXT DEFAULT '', hashtags TEXT DEFAULT '', description_alt TEXT DEFAULT '',
   image_paths TEXT DEFAULT '[]', status TEXT DEFAULT 'draft', scheduled_at TEXT DEFAULT '', ig_media_id TEXT DEFAULT '', ig_permalink TEXT DEFAULT '',
   error TEXT DEFAULT '', created_at TEXT DEFAULT '', approved_at TEXT DEFAULT '', published_at TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS imagegen_usage(day TEXT NOT NULL, provider TEXT NOT NULL, n INTEGER DEFAULT 0, PRIMARY KEY(day, provider));
+CREATE TABLE IF NOT EXISTS imagegen_usage(day TEXT NOT NULL, provider TEXT NOT NULL, n INTEGER DEFAULT 0, neurons INTEGER DEFAULT 0, PRIMARY KEY(day, provider));
 CREATE TABLE IF NOT EXISTS cast_members(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id INTEGER NOT NULL, role TEXT NOT NULL, name TEXT DEFAULT '',
   description TEXT DEFAULT '', seed INTEGER DEFAULT 1, UNIQUE(brand_id, role));
 CREATE TABLE IF NOT EXISTS screenshots(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id INTEGER NOT NULL, product_id INTEGER NOT NULL, path TEXT NOT NULL,
   title TEXT DEFAULT '', note TEXT NOT NULL, width INTEGER DEFAULT 0, height INTEGER DEFAULT 0, created_at TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS characters(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT DEFAULT '', master TEXT DEFAULT '',
+  source TEXT DEFAULT '', created_at TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS img_queue(id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, spec TEXT NOT NULL, status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT '', done_at TEXT DEFAULT '', error TEXT DEFAULT '');
 """
-EXTRA_COLS = {"posts": [("template", "TEXT DEFAULT ''"), ("spec_json", "TEXT DEFAULT '{}'")]}
+EXTRA_COLS = {"posts": [("template", "TEXT DEFAULT ''"), ("spec_json", "TEXT DEFAULT '{}'")], "imagegen_usage": [("neurons", "INTEGER DEFAULT 0")],
+              "cast_members": [("char_id", "INTEGER DEFAULT 0")]}
 
 # Demo data only: text comes from the owner's own pitch lines. Edit or delete in the Brand kit page.
 SEED = [
@@ -60,6 +65,11 @@ def ensure(c):
     for b in c.execute("SELECT id FROM brands").fetchall():
         for role, nm, desc, seed in imagegen.DEFAULT_CAST:
             c.execute("INSERT OR IGNORE INTO cast_members(brand_id,role,name,description,seed) VALUES(?,?,?,?,?)", (b[0], role, nm, desc, seed))
+    if not c.execute("SELECT 1 FROM characters LIMIT 1").fetchone():             # shared character library: the 3 defaults need masters generated
+        for role, nm, desc, seed in imagegen.DEFAULT_CAST:
+            c.execute("INSERT INTO characters(name,description,source,created_at) VALUES(?,?,?,?)", (nm, desc, "seed", now()))
+    for role, nm, desc, seed in imagegen.DEFAULT_CAST:
+        c.execute("UPDATE cast_members SET char_id=(SELECT id FROM characters WHERE name=? ORDER BY id LIMIT 1) WHERE role=? AND char_id=0", (nm, role))
     c.commit()
     for name, *_ in SEED:
         (ASSETS / slug(name) / "photos").mkdir(parents=True, exist_ok=True)

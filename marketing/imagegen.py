@@ -16,8 +16,9 @@ SLEEP = time.sleep                                        # tests replace this
 STYLE = "premium editorial caricature illustration, expressive faces, slightly exaggerated features, warm lighting, small Indian kirana shop, clean composition"
 NO_TEXT = ("No text anywhere: blank signboards, no signs, no readable text, no letters, no numbers, no logos, no watermarks, no captions, no speech bubbles; "
            "any paper or screen stays blank.")
-SAFETY = ("Original fictional characters only, not resembling any real person, celebrity, brand mascot or known cartoon character. " + NO_TEXT +
-          " Wide horizontal composition, characters centered with the whole upper body visible and a clear margin around them.")
+FRAMING = ("Medium shot, whole upper body visible. Characters fill at most 70 percent of the frame height, centered, with a clear empty margin on every side. "
+           "Plain uncluttered background.")
+SAFETY = ("Original fictional characters only, not resembling any real person, celebrity, brand mascot or known cartoon character. " + NO_TEXT + " " + FRAMING)
 BG_STYLE = "premium editorial illustration, warm soft lighting, clean uncluttered composition, shallow depth, slightly blurred background"
 BG_PLACES = {"shop": "an empty small Indian kirana shop interior with a wooden counter and shelves",
              "office": "an empty small Indian office with a plain desk and a window"}
@@ -61,9 +62,41 @@ def used_today(c, provider=None):
     return {r[0]: r[1] for r in c.execute("SELECT provider, n FROM imagegen_usage WHERE day=?", (today(),))}
 
 
-def count_use(c, provider):
-    c.execute("INSERT INTO imagegen_usage(day,provider,n) VALUES(?,?,1) ON CONFLICT(day,provider) DO UPDATE SET n=n+1", (today(), provider))
+def count_use(c, provider, neurons=0):
+    c.execute("INSERT INTO imagegen_usage(day,provider,n,neurons) VALUES(?,?,1,?) ON CONFLICT(day,provider) DO UPDATE SET n=n+1, neurons=neurons+?",
+              (today(), provider, neurons, neurons))
     c.commit()
+
+
+# Cloudflare free tier is counted in neurons per day (10,000). Estimates: about 125 for a 1024x1024 image with 4 references.
+NEURON_CAP = 10000
+NEURON_SCHNELL = 10
+NEURON_IMAGE_4REF = 125
+
+
+def neurons_for(kind, refs=0):
+    return NEURON_SCHNELL if kind == "schnell" else 45 + 20 * min(4, max(0, refs))
+
+
+def neurons_today(c):
+    r = c.execute("SELECT COALESCE(SUM(neurons),0) FROM imagegen_usage WHERE day=? AND provider='cloudflare'", (today(),)).fetchone()
+    return r[0] or 0
+
+
+def neuron_cap(setting):
+    try:
+        return int(setting("mkt_neuron_cap", NEURON_CAP))
+    except Exception:
+        return NEURON_CAP
+
+
+def images_left(c, setting):
+    """How many more reference images fit in today's free budget (worst case 125 neurons each)."""
+    return max(0, (neuron_cap(setting) - neurons_today(c)) // NEURON_IMAGE_4REF)
+
+
+def queued_count(c):
+    return c.execute("SELECT COUNT(*) FROM img_queue WHERE status='pending'").fetchone()[0]
 
 
 def cap(provider, setting):
@@ -199,13 +232,17 @@ def generate(prompt, seed, provider, env, conn, setting, ref=None, fresh=False):
         return {"file": None, "provider": "svg", "reason": st[provider + "_msg"] or (provider + " is not configured")}
     c = conn()
     try:
-        if used_today(c, provider) >= cap(provider, setting):
+        cost = NEURON_SCHNELL if provider == "cloudflare" else 0
+        if provider == "cloudflare":
+            if neurons_today(c) + cost > neuron_cap(setting):
+                return {"file": None, "provider": "svg", "reason": "cloudflare daily limit reached (%d neurons)" % neuron_cap(setting)}
+        elif used_today(c, provider) >= cap(provider, setting):
             return {"file": None, "provider": "svg", "reason": "%s daily limit reached (%d images)" % (provider, cap(provider, setting))}
         try:
             data = call_with_retry(fn, prompt, seed, env, ref)
         except ImageError as ex:
             return {"file": None, "provider": "svg", "reason": "%s: %s" % (provider, str(ex)[:160])}
-        count_use(c, provider)
+        count_use(c, provider, cost)
     finally:
         c.close()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -266,3 +303,155 @@ def scene_prompt(slide, cast, scene_names):
 
 def seed_for(base, variant):
     return int(base) + 7919 * int(variant or 0)
+
+
+# ---------------- reference images: Cloudflare flux-2-klein-4b (free, no Gemini needed) ----------------
+KLEIN = "@cf/black-forest-labs/flux-2-klein-4b"
+KLEIN_URL = "https://api.cloudflare.com/client/v4/accounts/%s/ai/run/" + KLEIN
+SCENE_W, SCENE_H = 1024, 720                                 # picture box 1080x760 is 1.42:1; sizes are multiples of 16
+SAME = "Same person as in the reference image, same face, hair, clothes. "
+CAND_STYLE = ("premium editorial caricature illustration, upper body portrait, plain light background, centered, looking at the viewer. "
+              "Expressive face, slightly exaggerated features, warm lighting. " + NO_TEXT)
+QUOTED = re.compile("[\"“”'][^\"“”']{0,200}[\"“”']")
+
+
+def http_post_multipart(url, headers, fields, files):
+    """multipart/form-data POST. fields: {name: str}, files: {name: bytes}. Single seam for tests."""
+    try:
+        r = requests.post(url, headers=headers, data=fields, files={k: (k + ".png", v, "image/png") for k, v in files.items()}, timeout=TIMEOUT * 2)
+    except requests.RequestException as ex:
+        raise Retryable("network error: %s" % type(ex).__name__)
+    if r.status_code == 429 or r.status_code >= 500:
+        raise Retryable("HTTP %d" % r.status_code)
+    if r.status_code >= 400:
+        raise ImageError("HTTP %d: %s" % (r.status_code, r.text[:160].replace("\n", " ")))
+    try:
+        return r.json()
+    except ValueError:
+        raise Retryable("answer was not JSON")
+
+
+def klein(prompt, refs, w, h, env):
+    """refs: list of image bytes (input_image_0..3). Returns image bytes."""
+    acc, tok = env("CF_ACCOUNT_ID"), env("CF_API_TOKEN")
+    if not (acc and tok):
+        raise ImageError("CF_ACCOUNT_ID / CF_API_TOKEN not set")
+    fields = {"prompt": prompt, "width": str(int(w)), "height": str(int(h))}
+    files = {"input_image_%d" % k: b for k, b in enumerate(refs[:4])}
+    j = http_post_multipart(KLEIN_URL % acc, {"Authorization": "Bearer " + tok}, fields, files)
+    img = (j.get("result") or {}).get("image")
+    if not img:
+        raise Retryable("no image in answer")
+    return _b64(img)
+
+
+def ref_key(prompt, refs, w, h):
+    hs = [hashlib.sha256(b).hexdigest()[:16] for b in refs]
+    return hashlib.sha256(json.dumps(["klein", prompt, hs, w, h], ensure_ascii=False).encode("utf-8")).hexdigest()[:32]
+
+
+def _enqueue(c, key, spec):
+    c.execute("INSERT OR IGNORE INTO img_queue(key,spec,created_at) VALUES(?,?,?)", (key, json.dumps(spec, ensure_ascii=False), time.strftime("%Y-%m-%d %H:%M:%S")))
+    c.commit()
+
+
+def generate_refs(prompt, ref_files, env, conn, setting, w=SCENE_W, h=SCENE_H, fresh=False, queue=True):
+    """One klein image with the characters' locked masters as references. At the daily cap the call is queued for tomorrow (not failed)."""
+    refs = [pathlib.Path(f).read_bytes() for f in ref_files][:4]
+    if not refs:
+        return {"file": None, "provider": "svg", "reason": "no character masters yet"}
+    key = ref_key(prompt, refs, w, h)
+    hit = None if fresh else cache_file(key)
+    if hit:
+        return {"file": hit, "provider": "cloudflare-ref", "cached": True}
+    st = status(env)
+    if not st["cloudflare"]:
+        return {"file": None, "provider": "svg", "reason": st["cloudflare_msg"]}
+    c = conn()
+    try:
+        cost = neurons_for("klein", len(refs))
+        if neurons_today(c) + cost > neuron_cap(setting):
+            if queue:
+                _enqueue(c, key, {"prompt": prompt, "refs": [str(f) for f in ref_files][:4], "w": w, "h": h})
+            return {"file": None, "provider": "svg", "queued": True, "reason": "daily free limit reached: queued for tomorrow"}
+        try:
+            data = call_with_retry(lambda p, s_, e, r: klein(p, refs, w, h, e), prompt, 0, env, None)
+        except ImageError as ex:
+            return {"file": None, "provider": "svg", "reason": "cloudflare-ref: %s" % str(ex)[:160]}
+        count_use(c, "cloudflare", cost)
+    finally:
+        c.close()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    p = CACHE_DIR / (key + (".png" if data[:4] == b"\x89PNG" else ".jpg"))
+    p.write_bytes(data)
+    return {"file": p, "provider": "cloudflare-ref", "cached": False}
+
+
+def drain_queue(env, conn, setting, limit=20):
+    """Make the queued images when budget is available (called from the scheduler tick). The cached results make the next render free."""
+    c = conn()
+    try:
+        rows = c.execute("SELECT id,spec FROM img_queue WHERE status='pending' ORDER BY id LIMIT ?", (limit,)).fetchall()
+    finally:
+        c.close()
+    done = 0
+    for rid, spec in rows:
+        sp = json.loads(spec)
+        files = [f for f in sp["refs"] if pathlib.Path(f).is_file()]
+        r = generate_refs(sp["prompt"], files, env, conn, setting, sp["w"], sp["h"], queue=False) if files else {"file": None, "reason": "reference image missing"}
+        c = conn()
+        try:
+            if r.get("file"):
+                c.execute("UPDATE img_queue SET status='done', done_at=? WHERE id=?", (time.strftime("%Y-%m-%d %H:%M:%S"), rid))
+                done += 1
+            elif "limit" in (r.get("reason") or ""):
+                break                                                     # still no budget: try again on the next tick
+            else:
+                c.execute("UPDATE img_queue SET status='failed', error=? WHERE id=?", ((r.get("reason") or "")[:200], rid))
+            c.commit()
+        finally:
+            c.close()
+    return done
+
+
+def ref_scene_prompt(slide, cast, scene_names):
+    """Prompt for klein: starts with the 'same person' line, then the scene. cast items need role/name/master. Returns (prompt, [master files])."""
+    by = {c["role"]: c for c in cast}
+    chars = [by[ch["role"]] for ch in slide.get("characters", [])[:2] if by.get(ch.get("role")) and by[ch["role"]].get("master")]
+    names = {r: by[r]["name"] for r in by if by[r]["name"]}
+    desc = QUOTED.sub("", scrub(slide.get("description"), names))
+    two = len(chars) == 2
+    head = ("The first person is the same as in reference image 1, the second person is the same as in reference image 2: same faces, hair, clothes. " if two else SAME)
+    pos = ("Positions: " + ", ".join("person %d on the %s" % (k + 1, ch.get("position") or "center") for k, ch in enumerate(slide["characters"][:2])) + ". ") if two else ""
+    prompt = "%s%s. Setting: %s. %sScene: %s. Expressions: %s. %s" % (
+        head, STYLE, scene_names.get(slide.get("scene"), "shop"), pos, desc or "the characters talk",
+        ", ".join(ch.get("expression") or "neutral" for ch in slide.get("characters", [])[:2]), SAFETY)
+    return prompt, [c["master"] for c in chars]
+
+
+def scene_chain(slide, cast, scene_names, hq, env, conn, setting, off=False):
+    """Scene picture: klein with locked masters, then (High quality) Gemini, then schnell from text, then SVG. Returns the usual result dict."""
+    if off:
+        return {"file": None, "provider": "svg", "reason": "AI illustrations switched off"}
+    reasons = []
+    rp, masters = ref_scene_prompt(slide, cast, scene_names)
+    if masters and len(masters) == len(slide.get("characters", [])[:2]):
+        r = generate_refs(rp, masters, env, conn, setting)
+        if r["file"] or r.get("queued"):
+            return r
+        reasons.append(r["reason"])
+    else:
+        reasons.append("no locked master image for this character yet")
+    prompt, seed = scene_prompt(slide, cast, scene_names)
+    r = generate_chain(prompt, seed_for(seed, slide.get("img_v")), hq, env, conn, setting)
+    if r["file"]:
+        r["note"] = "; ".join(reasons)
+        return r
+    r["reason"] = "; ".join(reasons + [r.get("reason", "")])
+    return r
+
+
+def candidate_prompt(description, k):
+    """Prompt for one of 3 master-image candidates (flux-1-schnell). Each differs a little so a missing seed field still gives three different people-poses."""
+    pose = ("slight smile", "friendly laugh", "confident calm look")[k % 3]
+    return "%s Character: %s. Expression: %s." % (CAND_STYLE, scrub(description), pose)

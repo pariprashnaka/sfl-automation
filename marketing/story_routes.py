@@ -113,8 +113,13 @@ def api_story_slide():
 
 def _cast(b):
     c = db()
-    rows = [dict(r) for r in c.execute("SELECT role,name,description,seed FROM cast_members WHERE brand_id=?", (b["id"],))]
+    rows = [dict(r) for r in c.execute(
+        "SELECT m.role, COALESCE(NULLIF(ch.name,''), m.name) AS name, COALESCE(NULLIF(ch.description,''), m.description) AS description, m.seed, ch.master AS master "
+        "FROM cast_members m LEFT JOIN characters ch ON ch.id=m.char_id WHERE m.brand_id=?", (b["id"],))]
     c.close()
+    for r in rows:                                              # master image of the locked character, if it exists
+        f = (mdb.ASSETS / r["master"]) if r.get("master") else None
+        r["master"] = str(f) if f and f.is_file() else None
     return rows or [dict(role=r, name=n, description=d, seed=sd) for r, n, d, sd in imagegen.DEFAULT_CAST]
 
 
@@ -136,8 +141,7 @@ def _gen_slide(slide, cast, j, ref=None):
         return {"file": None, "provider": "svg", "reason": ""}
     if slide.get("type") == "device":
         return imagegen.generate_chain(imagegen.empty_bg_prompt("shop"), imagegen.seed_for(5151, slide.get("img_v")), bool(j.get("hq")), M.env_val, M.conn, M.qset, off=off)
-    prompt, seed = cartoon.slide_prompt_for(slide, cast)
-    return imagegen.generate_chain(prompt, imagegen.seed_for(seed, slide.get("img_v")), bool(j.get("hq")), M.env_val, M.conn, M.qset, ref=ref, off=off)
+    return imagegen.scene_chain(slide, cast, cartoon.SCENES, bool(j.get("hq")), M.env_val, M.conn, M.qset, off=off)
 
 
 def _ref_bytes(script, cast, j):

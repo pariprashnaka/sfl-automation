@@ -110,6 +110,11 @@ def scheduler_tick(force=False):
     c.close()
     for pid in ids:
         publish_post(pid)
+    try:                                                       # make the pictures that were queued when the free daily budget ran out
+        from . import imagegen, routes
+        imagegen.drain_queue(routes.M.env_val, routes.M.conn, routes.M.qset)
+    except Exception:
+        pass
     return len(ids)
 
 

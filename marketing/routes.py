@@ -7,7 +7,7 @@ bp = Blueprint("marketing", __name__)
 M = None
 CAP = 40
 
-TABS = [("/marketing", "Dashboard"), ("/marketing/create", "Create"), ("/marketing/queue", "Queue"), ("/marketing/brands", "Brand kit")]
+TABS = [("/marketing", "Dashboard"), ("/marketing/create", "Create"), ("/marketing/queue", "Queue"), ("/marketing/brands", "Brand kit"), ("/marketing/characters", "Characters")]
 
 CSS = """<style>
 .mk h2{margin:0 0 14px}.mk .tabs{display:flex;gap:8px;margin:0 0 20px;border-bottom:1px solid var(--border)}
@@ -65,6 +65,7 @@ def dashboard():
     n24 = published_last_24h(c)
     from . import imagegen
     iu = imagegen.used_today(c)
+    left, nused, nq = imagegen.images_left(c, M.qset), imagegen.neurons_today(c), imagegen.queued_count(c)
     last = c.execute("SELECT p.*, b.name AS bname FROM posts p LEFT JOIN brands b ON b.id=p.brand_id ORDER BY p.id DESC LIMIT 5").fetchall()
     c.close()
     tiles = "".join("<div class='tile'><b>%d</b><small>%s</small></div>" % (counts.get(s, 0), s.capitalize()) for s in
@@ -76,7 +77,7 @@ def dashboard():
     body = flash() + (
         "<div class='tiles'>%s</div><div class='grid'>"
         "<div class='card'><h3>Publishing today</h3><b style='font-size:28px'>%d / %d</b><div class='note'>Posts published in the last 24 hours (cap %d).</div></div>"
-        "<div class='card'><h3>Images used today</h3><b style='font-size:28px'>%s</b><div class='note'>AI illustrations made today (cap per day: Cloudflare %d, Gemini %d). Cached pictures are free.</div></div>"
+        "<div class='card'><h3>Images left today</h3><b style='font-size:28px'>~%d</b><div class='note'>Free Cloudflare budget: %d of %d neurons used (about 125 per picture with references). Made today: %s. Waiting for tomorrow: %d. Cached pictures are free.</div></div>"
         "<div class='card'><h3>Connection</h3>%s<div style='margin-top:12px'><button type='button' onclick='testConn()'>Test connection</button> "
         "<span id='tc' class='note'></span></div>"
         "<form method='post' action='/marketing/dry-run' style='margin-top:12px'><span class='chip %s'>Dry run %s</span> "
@@ -85,7 +86,7 @@ def dashboard():
         "<script>function testConn(){var t=document.getElementById('tc');t.textContent='Testing...';"
         "fetch('/api/marketing/test',{method:'POST'}).then(function(r){return r.json()}).then(function(j){t.textContent=j.ok?('Connected as @'+j.username):j.error;})"
         ".catch(function(){t.textContent='Request failed'});}</script>") % (
-        tiles, n24, CAP, CAP, esc(", ".join("%s %d" % kv for kv in iu.items()) or "0"), imagegen.cap("cloudflare", M.qset), imagegen.cap("gemini", M.qset), hl, "on" if dry else "bad", "ON" if dry else "OFF", "off" if dry else "on", rows)
+        tiles, n24, CAP, CAP, left, nused, imagegen.neuron_cap(M.qset), esc(", ".join("%s %d" % kv for kv in iu.items()) or "0"), nq, hl, "on" if dry else "bad", "ON" if dry else "OFF", "off" if dry else "on", rows)
     return page("/marketing", body)
 
 
@@ -134,6 +135,7 @@ def brands_page():
     c = db()
     brands = c.execute("SELECT * FROM brands ORDER BY id").fetchall()
     prods = c.execute("SELECT * FROM products ORDER BY id").fetchall()
+    lib = c.execute("SELECT id,name,master FROM characters ORDER BY id").fetchall()
     cm = {}
     for m in c.execute("SELECT * FROM cast_members ORDER BY id"):
         cm.setdefault(m["brand_id"], []).append(m)
@@ -158,12 +160,10 @@ def brands_page():
                 esc(p["key_points"]), esc(p["price_note"]), shots.widget(p["id"]))
         cast = ""
         for m in cm.get(b["id"], []):
-            cast += ("<div class='card' style='margin:8px 0'><b>%s</b> <span class='note'>(%s)</span><div class='row'><div><label>Name</label><input name='name_%s' value='%s'></div>"
-                     "<div style='flex:0 0 120px;min-width:100px'><label>Seed</label><input name='seed_%s' type='number' value='%d'></div></div>"
-                     "<label>Fixed visual description (age, face, moustache/glasses, clothes, colours)</label><textarea name='desc_%s' rows='3'>%s</textarea></div>") % (
-                esc(m["name"]), esc(m["role"]), m["role"], esc(m["name"]), m["role"], m["seed"], m["role"], esc(m["description"]))
-        cast = ("<details style='margin-top:14px'><summary>Cast for cartoon stories</summary><div class='note'>Original characters only. Every illustration prompt includes this "
-                "description and uses the seed, so the same person looks the same in every slide.</div><form method='post' action='/marketing/cast/%d'>%s"
+            opts = "".join("<option value='%d'%s>%s%s</option>" % (x["id"], " selected" if x["id"] == m["char_id"] else "", esc(x["name"]), "" if x["master"] else " (no master yet)") for x in lib)
+            cast += ("<div class='row' style='margin:6px 0'><div style='flex:0 0 140px'><b>%s</b></div><div><select name='char_%s'>%s</select></div></div>") % (esc(m["role"]), m["role"], opts)
+        cast = ("<details style='margin-top:14px'><summary>Cast for cartoon stories</summary><div class='note'>Pick which library character plays each role. Characters, their locked master "
+                "images and descriptions are managed on the <a href='/marketing/characters'>Characters</a> page and shared by all brands.</div><form method='post' action='/marketing/cast/%d'>%s"
                 "<button>Save cast</button></form></details>") % (b["id"], cast)
         tpl = (
             "<div class='card'><h3>%s %s</h3><div>%s</div><form method='post' action='/marketing/brand/%d' enctype='multipart/form-data'>"
@@ -191,13 +191,9 @@ def cast_save(bid):
     c = db()
     try:
         for m in c.execute("SELECT * FROM cast_members WHERE brand_id=?", (bid,)).fetchall():
-            r = m["role"]
-            try:
-                seed = int(f.get("seed_" + r, m["seed"]))
-            except ValueError:
-                seed = m["seed"]
-            c.execute("UPDATE cast_members SET name=?, description=?, seed=? WHERE id=?",
-                      ((f.get("name_" + r) or m["name"]).strip()[:40], (f.get("desc_" + r) or m["description"]).strip()[:600], max(0, min(seed, 2147483000)), m["id"]))
+            cid = f.get("char_" + m["role"], type=int)
+            if cid and c.execute("SELECT 1 FROM characters WHERE id=?", (cid,)).fetchone():
+                c.execute("UPDATE cast_members SET char_id=? WHERE id=?", (cid, m["id"]))
         c.commit()
     finally:
         c.close()
@@ -301,5 +297,5 @@ def register(mod):
     c = mod.conn()
     mdb.ensure(c)
     c.close()
-    from . import create, queue, story_routes, shots        # noqa: F401  (adds their routes to the blueprint)
+    from . import create, queue, story_routes, shots, characters        # noqa: F401  (adds their routes to the blueprint)
     mod.app.register_blueprint(bp)

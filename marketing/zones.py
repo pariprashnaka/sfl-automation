@@ -1,5 +1,5 @@
 """Slide layout for every type (cartoon scene, screenshot, device, call to action).
-A 1080x1350 slide is split into fixed zones that never overlap: header strip, PICTURE zone (about 52% of the height), TEXT zone (speech bubbles,
+A 1080x1350 slide is split into fixed zones that never overlap: PICTURE box (top, 1080x760), TEXT box (below it), logo/footer strip. Nothing in the text box (speech bubbles,
 caption, call-to-action button) and footer strip. Text is never drawn on top of the picture. After the page is laid out in Chromium, FIT_JS shrinks
 text to a readable minimum and reports every box; check_layout() fails the render if anything overlaps or does not fit."""
 import math, pathlib, re
@@ -7,14 +7,14 @@ from PIL import Image
 from . import images, shotslides
 
 W, H = 1080, 1350
-HEAD = (60, 36, 960, 72)                 # x, y, w, h
-PIC = (60, 130, 960, 700)                # 51.9% of the height
-TXT = (60, 856, 960, 372)
-FOOT = (60, 1250, 960, 64)
+PIC = (0, 0, 1080, 760)                  # picture box: top of the slide, full width (56% of the height). x, y, w, h
+TXT = (60, 784, 960, 466)                # text box: everything below the picture, above the footer strip
+FOOT = (60, 1270, 960, 64)               # logo / footer strip, inside the bottom margin
+DEVBOX = (60, 30, 960, 700)              # drawn devices are laid out in this box inside the picture box
 TAIL = 22                                # tail height, sits inside the text zone
 BUBBLE_MAX = 0.64                        # bubble width as a share of the zone: leaves the other side free for the second tail
 BUB_FS, BUB_MIN = 40, 28
-CAP_FS, CAP_MIN = 42, 28
+CAP_FS, CAP_MIN = 54, 28
 CTA_H, CTA_FS, CTA_MIN = 118, 50, 30
 CHIP_H, BUB_PAD = 34, 26
 FRAME_B = 6
@@ -49,11 +49,11 @@ def budgets(n_bub, has_cap, has_cta):
         r -= TAIL
     cap_h = 0
     if has_cap:
-        cap_h = 96 if n_bub else min(r, 300)
+        cap_h = 110 if n_bub else min(r, 340)
         r -= cap_h + (14 if n_bub else 0)
     bub_h = 0
     if n_bub:
-        bub_h = max(0, min(230, (r - 14 * (n_bub - 1)) // n_bub))
+        bub_h = max(0, min(260, (r - 14 * (n_bub - 1)) // n_bub))
     return {"cta": cta_h, "cap": cap_h, "bub": bub_h}
 
 
@@ -188,15 +188,15 @@ def pic_device(slide, lookup, out_dir, accent, tag, bg_file):
         inner, iw, ih = shot_img(shot, lookup(shot["id"]), sw, sh, out_dir, "%s_dev.png" % tag, accent)
         scr += inner.replace("class='sw' style=", "class='sw' data-c='1' style=")
     scr += "</div>"
-    return bg + chrome + scr
+    return bg + "<div style='position:absolute;left:%dpx;top:%dpx;width:%dpx;height:%dpx'>%s%s</div>" % (DEVBOX + (chrome, scr))
 
 
 # ---------------- page ----------------
 CSS = """<style>
 .zr{position:relative;width:1080px;height:1350px;overflow:hidden;background:__BG__;color:__TX__}
-.hd{position:absolute;left:60px;top:36px;width:960px;height:72px;display:flex;justify-content:space-between;align-items:center}
-.ft{position:absolute;left:60px;top:1250px;width:960px;height:64px;border-top:2px solid __LN__;display:flex;justify-content:space-between;align-items:center;font-size:28px;color:__MU__}
-.pic{position:absolute;left:60px;top:130px;width:960px;height:700px;border-radius:30px;overflow:hidden;background:#1a1a1d}
+.ft{position:absolute;left:60px;top:1270px;width:960px;height:64px;border-top:2px solid __LN__;display:flex;justify-content:space-between;align-items:center;font-size:26px;color:__MU__}
+.ft .logo{height:44px}.ft .mark{font-size:34px}
+.pic{position:absolute;left:0;top:0;width:1080px;height:760px;border-radius:0 0 36px 36px;overflow:hidden;background:#1a1a1d}
 .pic img.ill{width:100%;height:100%;object-fit:cover;display:block}.pic .svgw{position:absolute;inset:0}
 .pic.grad{background:linear-gradient(135deg,__AC__ 0%,__BG2__ 95%)}
 .bgimg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.bgdim{position:absolute;inset:0;background:rgba(0,0,0,.18)}
@@ -208,14 +208,14 @@ CSS = """<style>
 .lbase{position:absolute;height:26px;background:linear-gradient(#cfd3da,#8e939c);border-radius:0 0 26px 26px;box-shadow:0 14px 30px rgba(0,0,0,.45)}
 .tneck{position:absolute;width:60px;height:50px;background:linear-gradient(90deg,#20232a,#3b3f48,#20232a)}.tfoot{position:absolute;width:300px;height:16px;border-radius:10px;background:#2a2d34}
 .notch{position:absolute;width:100px;height:22px;border-radius:12px;background:#0a0b0d;z-index:3}
-.tz{position:absolute;left:60px;top:856px;width:960px;height:372px;display:flex;flex-direction:column;gap:14px}
+.tz{position:absolute;left:60px;top:784px;width:960px;height:466px;display:flex;flex-direction:column;gap:14px}
 .bw{position:relative;width:100%;flex:none}.bw.first{margin-top:22px}
 .bb{background:#fff;color:#111;border-radius:30px;padding:12px 24px 12px;width:fit-content;max-width:64%;min-width:38%;overflow:hidden;box-shadow:0 5px 18px rgba(0,0,0,.35)}
 .bw.l .bb{margin-right:auto}.bw.r .bb{margin-left:auto}.bw.c .bb{margin:0 auto;max-width:76%;min-width:0}
 .chip{display:inline-block;background:__AC__;color:__ONAC__;font-weight:700;font-size:22px;line-height:28px;padding:0 14px;border-radius:99px;margin-bottom:6px}
 .bt{font-size:40px;line-height:1.3;font-weight:700;overflow:hidden}
 .tail{position:absolute;width:0;height:0;border-left:14px solid transparent;border-right:14px solid transparent;border-bottom:22px solid #fff;transform:translateX(-50%);top:-22px}
-.cap{font-size:42px;line-height:1.3;font-weight:700;overflow:hidden;color:__TX__;flex:none}
+.cap{font-size:54px;line-height:1.3;font-weight:700;overflow:hidden;color:__TX__;flex:none}
 .cta{background:__AC__;color:__ONAC__;font-weight:700;border-radius:99px;display:flex;align-items:center;justify-content:center;text-align:center;padding:0 40px;flex:none;overflow:hidden;align-self:center;max-width:100%}
 </style>"""
 
@@ -296,6 +296,6 @@ def build(spec, slide, i, n, ctx):
     css = CSS
     for k, v in {"__BG__": pal["bg"], "__TX__": pal["tx"], "__AC__": pal["ac"], "__ONAC__": pal["on_ac"], "__MU__": pal["mu"], "__LN__": "#2a2d34", "__BG2__": pal["bg"]}.items():
         css = css.replace(k, v)
-    head = "<div class='hd' data-text='header'>%s<span style='font-size:26px;letter-spacing:.1em;color:%s'>%d / %d</span></div>" % (images.brandmark(spec), pal["mu"], i + 1, n)
-    foot = "<div class='ft' data-text='footer'><span>%s</span><span>%s</span></div>" % (images.e(spec["footer_left"]), images.e(spec["footer_right"]))
-    return "%s<div class='zr'>%s%s%s%s</div>" % (css, head, pic, z_html, foot)
+    foot = "<div class='ft' data-text='footer'>%s<span>%d / %d</span><span>%s</span></div>" % (
+        images.brandmark(spec), i + 1, n, images.e(" - ".join(x for x in (spec["footer_left"], spec["footer_right"]) if x)))
+    return "%s<div class='zr'>%s%s%s</div>" % (css, pic, z_html, foot)
