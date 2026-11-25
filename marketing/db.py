@@ -27,8 +27,6 @@ SEED = [
        "Patients in one place\nBilling and reports\nBuilt for hospitals", ""),
       ("LIMS", "Laboratory software that helps a lab manage samples, billing and reports in one place.",
        "Samples tracked\nReports in one place\nBuilt for labs", "")]),
-    ("BBMetals", "#f5a524", "#0b0b0c", "BBMetals", "Demo brand", "", "Demo brand with placeholder text. Replace with real details.",
-     [("Demo product", "Placeholder product. Describe what it really is before posting.", "Add real key points here", "")]),
 ]
 
 

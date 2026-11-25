@@ -41,8 +41,8 @@ class Stage1(unittest.TestCase):
         c = self.m.conn()
         mdb.ensure(c)
         mdb.ensure(c)
-        self.assertEqual(c.execute("SELECT COUNT(*) FROM brands").fetchone()[0], 2)
-        self.assertGreaterEqual(c.execute("SELECT COUNT(*) FROM products").fetchone()[0], 4)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM brands").fetchone()[0], 1)
+        self.assertGreaterEqual(c.execute("SELECT COUNT(*) FROM products").fetchone()[0], 3)
         cols = {r[1] for r in c.execute("PRAGMA table_info(posts)")}
         self.assertTrue({"platforms", "ig_media_id", "ig_permalink", "published_at"} <= cols)
 
