@@ -4,6 +4,7 @@ import json, re, threading, time, uuid, pathlib
 from flask import request, jsonify
 from . import db as mdb, images, cartoon, hashtags, imagegen, shotslides, zones
 from . import shots as shotlib
+from . import vision
 from . import routes
 from .routes import bp, db
 from .create import parse_json, ai, AIError
@@ -66,7 +67,7 @@ def write_script(b, p, j, set_stage):
             last = ex
     else:
         raise ValueError("The AI answer could not be read. Press Write script again.")
-    script = cartoon.clean_script(d, n, cartoon.product_facts(p), _lang(j), j.get("cta") or "", product_name=p["name"] if p else "")
+    script = cartoon.clean_script(d, n, cartoon.product_facts(p), _lang(j), j.get("cta") or "", product_name=p["name"] if p else "", allowed=[b["name"]])
     tags = hashtags.build(script.pop("hashtags_raw"))
     script["hashtags"] = hashtags.as_text(tags)
     script["tiers"] = hashtags.tier_map(tags)
@@ -157,10 +158,77 @@ def _ref_bytes(script, cast, j):
     return f.read_bytes() if f else None
 
 
+TEXT_HITS = 2                  # text-like regions in the background that count as "writing found"
+MAX_PICTURES = 5               # per slide per attempt: 1 + up to 3 identity redraws + up to 2 text redraws, never more than this
+
+
+def missing_masters(slides, cast):
+    """Names of characters used on scene slides that have no locked master image (render is blocked until they have one)."""
+    by = {c["role"]: c for c in cast}
+    out = []
+    for s in slides:
+        if s.get("type", "scene") != "scene":
+            continue
+        for ch in s["characters"]:
+            c = by.get(ch["role"])
+            if not c or not c.get("master"):
+                nm = (c or {}).get("name") or cartoon.ROLES.get(ch["role"], ch["role"])
+                if nm not in out:
+                    out.append(nm)
+    return out
+
+
+def master_block_message(names):
+    return ("No locked master image yet for: %s. Make or upload one on the Characters page (/marketing/characters), then render again." % ", ".join(names))
+
+
+def identity_threshold():
+    try:
+        return float(routes.M.qset("mkt_identity_min", vision.IDENTITY_MIN))
+    except (TypeError, ValueError):
+        return vision.IDENTITY_MIN
+
+
+def make_picture(slide, cast, j, attempt=0):
+    """One scene picture with its quality checks: writing in the background (redraw up to 2x), identity against the locked masters (redraw up to 3x,
+    then flag 'check this face'). Best-effort filters, not guarantees. Returns the imagegen result dict plus identity/text fields."""
+    base = int(slide.get("img_v") or 0) + 10 * attempt
+    by = {c["role"]: c for c in cast}
+    id_left, txt_left, k = 3, 2, 0
+    thr = identity_threshold()
+    while True:
+        r = _gen_slide(dict(slide, img_v=base + k), cast, j)
+        if not r.get("file") or slide.get("type", "scene") != "scene":
+            return r
+        from PIL import Image
+        img = Image.open(r["file"])
+        chars = slide["characters"]
+        heads = vision.head_boxes(img, chars)
+        bad_text = vision.text_regions(img, heads) >= TEXT_HITS
+        masters = [by[ch["role"]]["master"] for ch in chars if by.get(ch["role"]) and by[ch["role"]].get("master")]
+        scores = vision.identity_scores(img, chars, masters) if len(masters) == len(chars) else None
+        bad_id = bool(scores) and min(scores) < thr
+        if k + 1 < MAX_PICTURES and ((bad_text and txt_left > 0) or (bad_id and id_left > 0)):
+            if bad_text and txt_left > 0:
+                txt_left -= 1
+            else:
+                id_left -= 1
+            k += 1
+            continue
+        r.update(identity=scores or [], id_flag="check this face" if bad_id else "", text_flag=bad_text, pictures=k + 1)
+        if scores is None:
+            ok, why = vision.available()
+            r["id_note"] = "" if ok else "identity check skipped: " + why
+        return r
+
+
 def _img_fields(slide, r):
     slide["image"] = r["file"].name if r["file"] else ""
     slide["provider"] = r["provider"] if (r["file"] or slide.get("type", "scene") == "scene") else ""
-    slide["img_note"] = (r.get("reason") or r.get("note") or "")[:300]
+    slide["img_note"] = (r.get("reason") or r.get("note") or r.get("id_note") or "")[:300]
+    slide["identity"] = [float(x) for x in (r.get("identity") or [])][:2]
+    slide["id_flag"] = r.get("id_flag", "")
+    slide["text_flag"] = bool(r.get("text_flag"))
     return slide
 
 
@@ -175,12 +243,15 @@ def api_story_image():
         return jsonify(ok=False, error="Write the script first.")
     script["slides"] = [cartoon.clean_slide(s) for s in script["slides"]]
     cast = _cast(b)
+    miss = missing_masters(script["slides"][i:i + 1], cast) if j.get("imgmode") != "svg" else []
+    if miss:
+        return jsonify(ok=False, error=master_block_message(miss), link="/marketing/characters")
 
     def work(st):
         st("drawing picture for slide %d" % (i + 1))
         s = script["slides"][i]
         s["img_v"] = (s.get("img_v") or 0) + 1
-        r = _gen_slide(s, cast, j, ref=_ref_bytes(script, cast, j) if i else None)
+        r = make_picture(s, cast, j)
         return {"index": i, "slide": _img_fields(s, r)}
     return jsonify(ok=True, job=start_job(work))
 
@@ -227,15 +298,17 @@ def api_story_render():
     script = dict(script, slides=slides)
     tok = uuid.uuid4().hex[:10]
     cast = _cast(b)
-    provs = []
+    miss = missing_masters(slides, cast) if j.get("imgmode") != "svg" else []
+    if miss:                                                   # identity cannot be kept without a locked master
+        return jsonify(ok=False, error=master_block_message(miss), link="/marketing/characters")
+    provs = {}
 
-    def get_image(i):
+    def get_image(i, attempt=0):
         s = script["slides"][i]
-        ref = _ref_bytes(script, cast, j) if i else None
-        r = _gen_slide(s, cast, j, ref=ref)
+        r = make_picture(s, cast, j, attempt)
         _img_fields(s, r)
-        provs.append(r["provider"])
-        return str(r["file"]) if r["file"] else None
+        provs[i] = r["provider"]
+        return str(r["file"]) if r.get("file") else None
 
     def work(st):
         names = {c["role"]: c["name"] for c in cast if c["name"]}
@@ -243,7 +316,7 @@ def api_story_render():
                                       lookup=shots.get, names=names)
         for s in script["slides"]:
             s.pop("_file", None)
-        return {"token": tok, "images": ["/marketing/out/p_%s/%s" % (tok, pathlib.Path(f).name) for f in files], "providers": provs,
+        return {"token": tok, "images": ["/marketing/out/p_%s/%s" % (tok, pathlib.Path(f).name) for f in files], "providers": [provs[k] for k in sorted(provs)],
                 "slides": script["slides"], "added_cta": added}
     return jsonify(ok=True, job=start_job(work))
 

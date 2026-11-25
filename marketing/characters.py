@@ -186,6 +186,19 @@ def api_char_pick(cid):
         c.close()
 
 
+@bp.route("/api/marketing/identity", methods=["POST"])
+def api_identity_setting():
+    """Minimum identity score (0-1). Below it a picture is redrawn up to 3 times, then flagged 'check this face'."""
+    try:
+        v = float((request.get_json(force=True, silent=True) or {}).get("min"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="Enter a number between 0 and 1.")
+    if not 0.0 <= v <= 1.0:
+        return jsonify(ok=False, error="Enter a number between 0 and 1.")
+    routes.M.qset_save("mkt_identity_min", v)
+    return jsonify(ok=True, min=v)
+
+
 @bp.route("/marketing/char/<int:cid>")
 def char_image(cid):
     c = db()
@@ -222,6 +235,7 @@ function pick(id,name){J('/api/marketing/characters/'+id+'/pick','POST',{name:na
 function propose(){var s=say('pm');s('thinking');J('/api/marketing/characters/propose','POST',{brief:$('pbrief').value}).then(function(j){if(!j.ok){s(j.error,true);return;}
  poll(j.job,s,function(r){s('Add the ones you want to the library.');$('pout').innerHTML=r.characters.map(function(c,i){return "<div class='card' style='margin:6px 0'><b>"+esc(c.name)+"</b><div class='note'>"+esc(c.description)+"</div><button type='button' onclick='addChar("+i+")'>Add to library</button></div>";}).join('');window.PROPS=r.characters;});});}
 function addChar(i){var c=window.PROPS[i];J('/api/marketing/characters','POST',c).then(function(j){if(j.ok)location.reload();else say('pm')(j.error,true);});}
+function saveIdMin(){J('/api/marketing/identity','POST',{min:$('idmin').value}).then(function(j){say('idm')(j.ok?'Saved.':j.error,!j.ok);});}
 function newChar(){J('/api/marketing/characters','POST',{name:$('nn').value,description:$('nd').value}).then(function(j){if(j.ok)location.reload();else say('nm')(j.error,true);});}
 </script>"""
 
@@ -233,6 +247,15 @@ def characters_page():
     c.close()
     out = [flash(), "<div class='card'><h3>Character library</h3><div class='note'>Shared by all brands. Each character needs a locked master image: slides pass it to the image model so the "
            "same person appears in every slide. Making masters is free (Cloudflare). Original characters only, never real people, brands or known cartoon characters.</div></div>"]
+    from . import vision
+    ok, why = vision.available()
+    thr = routes.M.qset("mkt_identity_min", vision.IDENTITY_MIN)
+    out.append("<div class='card'><h3>Identity check</h3><div class='note'>After each picture the vault compares every face with its locked master (small CLIP model on this CPU, models in "
+               "D:\\vault\\models). Below the minimum score the picture is redrawn up to 3 times, then flagged \"check this face\". It is a best-effort filter, not a guarantee. "
+               "Photos compare poorly with cartoon pictures, so scores are most meaningful when the master is a generated caricature.</div>"
+               "<div class='row'><div><label>Minimum score (0-1)</label><input id='idmin' type='number' step='0.01' min='0' max='1' value='%s'></div>"
+               "<div style='flex:0'><button type='button' onclick='saveIdMin()'>Save</button></div></div><span id='idm' class='note'>%s</span></div>" % (
+                   esc(thr), "Identity model ready." if ok else "Identity check unavailable: " + esc(why)))
     out.append("<div class='card'><h3>Propose characters from a story</h3><textarea id='pbrief' rows='4' placeholder='Paste the story brief'></textarea>"
                "<div style='margin-top:8px'><button type='button' onclick='propose()'>Propose characters</button> <span id='pm' class='note'></span></div><div id='pout'></div></div>")
     for r in rows:

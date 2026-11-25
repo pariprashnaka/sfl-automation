@@ -15,9 +15,11 @@ SLEEP = time.sleep                                        # tests replace this
 
 STYLE = "premium editorial caricature illustration, expressive faces, slightly exaggerated features, warm lighting, clean composition"      # the place comes from the slide setting
 NO_TEXT = ("No text anywhere: blank signboards, no signs, no readable text, no letters, no numbers, no logos, no watermarks, no captions, no speech bubbles; "
-           "any paper or screen stays blank.")
-FRAMING = ("Wide shot, full environment visible, characters smaller in frame. Characters occupy at most 50 percent of the frame height, placed left and right of centre, "
-           "with the setting clearly visible and filling the rest of the frame. Signboards and papers stay blank, no readable text.")
+           "any paper or screen stays blank. Blank signboards, blank paper, no letters or writing anywhere.")
+FRAMING = ("Vertical 4:5 composition. The top 35 percent of the frame is an empty plain headroom band: plain wall or ceiling only, no objects, no faces, no equipment, no signs. "
+           "Wide shot, full environment visible, characters smaller in frame: characters stand in the lower 65 percent with heads at about 40 to 55 percent of the frame height, "
+           "occupy at most 50 percent of the frame height, placed left and right of centre, and end above the bottom 12 percent of the frame. "
+           "The setting is clearly visible around them. Never an extreme close-up. Signboards and papers stay blank, no readable text.")
 NO_DUPES = "No extra people, no duplicate faces, no crowd, no reflections of people. Each named character appears exactly once."
 
 
@@ -96,7 +98,7 @@ NEURON_IMAGE_4REF = 125
 
 
 def neurons_for(kind, refs=0):
-    return NEURON_SCHNELL if kind == "schnell" else 45 + 20 * min(4, max(0, refs))
+    return NEURON_SCHNELL if kind == "schnell" else int((45 + 20 * min(4, max(0, refs))) * 1.25)      # 1024x1280 is 25% more pixels than 1024x1024
 
 
 def neurons_today(c):
@@ -172,13 +174,14 @@ def cloudflare(prompt, seed, env, ref=None):
     if not (acc and tok):
         raise ImageError("CF_ACCOUNT_ID / CF_API_TOKEN not set")
     hdr = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
-    body = {"prompt": prompt, "steps": 6, "seed": int(seed) % 4294967295}
+    body = {"prompt": prompt, "steps": 6, "seed": int(seed) % 4294967295, "width": SCENE_W, "height": SCENE_H}
     try:
         j = http_post(CF_URL % acc, hdr, body)
     except ImageError as ex:
         if "HTTP 400" not in str(ex):
             raise
-        body.pop("seed")                                  # model rejected the seed field: ask without it
+        for k in ("seed", "width", "height"):             # model rejected an optional field: ask with only the prompt and steps
+            body.pop(k, None)
         j = http_post(CF_URL % acc, hdr, body)
     img = (j.get("result") or {}).get("image")
     if not img:
@@ -330,7 +333,7 @@ def seed_for(base, variant):
 # ---------------- reference images: Cloudflare flux-2-klein-4b (free, no Gemini needed) ----------------
 KLEIN = "@cf/black-forest-labs/flux-2-klein-4b"
 KLEIN_URL = "https://api.cloudflare.com/client/v4/accounts/%s/ai/run/" + KLEIN
-SCENE_W, SCENE_H = 1024, 720                                 # picture box 1080x760 is 1.42:1; sizes are multiples of 16
+SCENE_W, SCENE_H = 1024, 1280                                # 4:5 like the 1080x1350 slide; multiples of 16
 SAME = "Same person as in the reference image, same face, hair, clothes. "
 CAND_STYLE = ("premium editorial caricature illustration, upper body portrait, plain light background, centered, looking at the viewer. "
               "Expressive face, slightly exaggerated features, warm lighting. " + NO_TEXT)
@@ -449,6 +452,8 @@ def ref_scene_prompt(slide, cast, scene_names):
     prompt = "%s%s%s. Wide shot, full environment visible, characters smaller in frame, detailed %s background. %sAction: %s. Expressions: %s. %s %s" % (
         head, cnt, STYLE, setting_of(slide, scene_names), pos, desc or "the characters talk",
         ", ".join(ch.get("expression") or "neutral" for ch in slide.get("characters", [])[:2]), NO_DUPES, SAFETY)
+    if slide.get("img_v"):
+        prompt += " Variation %d: a different composition and pose." % slide["img_v"]       # a redraw must not hit the cache of the previous picture
     return prompt, [c["master"] for c in chars]
 
 

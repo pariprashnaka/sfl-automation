@@ -18,7 +18,7 @@ PRESETS = {
     "godown": ("Warehouse / godown", "warehouse godown with stacked cartons and sacks on racks"),
     "office": ("Office", "small modern office with desks, computers and a window"),
     "street": ("Street outside the building", "street outside a building with a plain entrance and a blank signboard"),
-    "phone_closeup": ("Phone-screen close-up", "close-up of a hand holding a smartphone, simple blurred background"),
+    "phone_closeup": ("Phone in hand (medium-wide)", "medium-wide shot of a character holding a smartphone as a small prop at chest height, the room visible around them, never a close-up"),
 }
 # which drawn fallback scene (SVG parts) to use when no AI picture is available
 SVG_FOR = {"retail_shop": "shelves", "billing_counter": "shop_counter", "godown": "shelves", "street": "shop_front", "phone_closeup": "plain", "office": "plain"}

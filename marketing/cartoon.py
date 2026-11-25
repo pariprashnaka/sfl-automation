@@ -183,7 +183,7 @@ def scene_svg(slide):
 def blank_slide():
     return {"scene": "shop_counter", "description": "", "characters": [{"role": "shopkeeper", "expression": "neutral", "position": "left"}],
             "props": [], "dialogue": [{"speaker": "shopkeeper", "text": ""}], "narration": "", "claim_note": "", "is_cta": False,
-            "image": "", "provider": "", "img_v": 0, "img_note": "",
+            "image": "", "provider": "", "img_v": 0, "img_note": "", "identity": [], "id_flag": "", "text_flag": False,
             "type": "scene", "shots": [], "layout": "single", "device": "tablet", "bg": "gradient", "setting_key": "", "setting": ""}
 
 
@@ -229,7 +229,9 @@ def clean_slide(s):
             "characters": chars, "props": props, "dialogue": dlg, "narration": imagegen.scrub(s.get("narration")),
             "claim_note": str(s.get("unsupported_claim") or s.get("claim_note") or "").strip(), "is_cta": bool(s.get("is_cta")),
             "image": imagegen.safe_name(s.get("image")) or "", "provider": s.get("provider") if s.get("provider") in PROVIDER_SET else "",
-            "img_v": int(s.get("img_v") or 0) % 100 if str(s.get("img_v") or "0").isdigit() else 0, "img_note": str(s.get("img_note") or "")[:300]})
+            "img_v": int(s.get("img_v") or 0) % 100 if str(s.get("img_v") or "0").isdigit() else 0, "img_note": str(s.get("img_note") or "")[:300],
+            "identity": [round(float(x), 3) for x in (s.get("identity") or []) if isinstance(x, (int, float))][:2], "id_flag": str(s.get("id_flag") or "")[:40],
+            "text_flag": bool(s.get("text_flag"))})
 
 
 def claim_flags(slide, facts):
@@ -297,7 +299,16 @@ def drop_cta_text(slides, cta):
                 s["narration"] = ""
 
 
-def clean_script(d, n, facts, lang="", cta="", notes=None, product_name=""):
+LATIN = re.compile(r"[A-Za-z][A-Za-z'-]*")
+
+
+def latin_words(text, allowed=()):
+    """English words in a Hindi text, except the brand / product names (which stay in Latin letters)."""
+    ok = {w.lower() for a in allowed for w in LATIN.findall(a or "")}
+    return [w for w in LATIN.findall(text or "") if w.lower() not in ok]
+
+
+def clean_script(d, n, facts, lang="", cta="", notes=None, product_name="", allowed=()):
     d = d if isinstance(d, dict) else {}
     slides = [clean_slide(s) for s in (d.get("slides") or [])][:MAX_SLIDES]
     if not slides:
@@ -312,6 +323,10 @@ def clean_script(d, n, facts, lang="", cta="", notes=None, product_name=""):
         s["claim_note"] = "claim not in product details - confirm before posting" if note else ""
         if lang == "Hindi" and s["dialogue"] and not any(DEVANAGARI.search(x["text"]) for x in s["dialogue"]):
             s["claim_note"] = s["claim_note"] or "dialogue is not in Devanagari - edit it or Regenerate slide"
+        if lang == "Hindi":
+            eng = latin_words(" ".join([x["text"] for x in s["dialogue"]] + [s["narration"]]), list(allowed) + [product_name])
+            if eng and not s["claim_note"]:
+                s["claim_note"] = "English words in Hindi text (%s) - write them in Devanagari, only brand and product names stay in English" % ", ".join(dict.fromkeys(eng))[:80]
     ensure_cta(slides, cta)
     drop_cta_text(slides, cta)
     return {"title": str(d.get("title") or "").strip(), "caption": str(d.get("caption") or "").strip(), "alt": str(d.get("alt") or "").strip(),
@@ -334,7 +349,8 @@ def script_prompt(brief, product, brand_name, language, n, tone, cta):
         "The owner describes the story in their own words (Hindi, English or Hinglish):\n<<<\n%s\n>>>\n\n"
         "PRODUCT FACTS (the only product claims you may state):\n%s\n\n"
         "Rules:\n- Write exactly %d slides telling the story in order. Each slide has 1 or 2 short dialogue lines (max 14 words each), spoken by the characters in it.\n"
-        "- Dialogue and narration language: %s. Tone: %s. Never write internal labels such as Shopkeeper, Shopkeeper2 or Customer inside dialogue, narration or descriptions.\n"
+        "- Dialogue and narration language: %s. Tone: %s. If the language is Hindi, write EVERY word in Devanagari: no English words at all except the brand and product names "
+        "(write common English words such as sample, report, register in Devanagari). Never write internal labels such as Shopkeeper, Shopkeeper2 or Customer inside dialogue, narration or descriptions.\n"
         "- The description field is one plain English sentence describing the picture only (people, what they do, the place). No dialogue, no quotes, no text on signs.\n"
         "- You may ONLY state product claims that appear in PRODUCT FACTS. If the story asks for a claim that is not there (a number, price, guarantee, feature), "
         "write the slide without it and put a short note of the missing claim in that slide's unsupported_claim. Never invent numbers, prices or results.\n"
@@ -373,11 +389,14 @@ def slide_prompt_for(slide, cast):
 
 
 def render_script(script, brand, product, out_dir, cta="", progress=None, get_image=None, lookup=None, names=None):
-    """Render the script exactly as written to slide_N.jpg files (1080x1350). Slide types can be mixed. One slide at a time, browser closed after each.
-    After layout, the boxes are checked: any text over the picture, or text that does not fit, fails the render with a clear message."""
+    """Render the script exactly as written to slide_N.jpg files (1080x1350, one full picture per slide, bubbles in the headroom band).
+    get_image(i, attempt) -> picture path or None (None = drawn parts / brand gradient). If a bubble would touch a face the picture is redrawn
+    (attempt 1, 2); after that the render fails with a clear message. Slide types can be mixed."""
     msg = images.ram_message()
     if msg:
         raise images.RenderError(msg)
+    from PIL import Image
+    from . import vision
     spec = images.build_spec("carousel", "highlight", brand, product, script.get("title") or "", cta=cta or "")
     w, h = spec["size"]
     out_dir = pathlib.Path(out_dir)
@@ -388,32 +407,44 @@ def render_script(script, brand, product, out_dir, cta="", progress=None, get_im
     files = []
     from playwright.sync_api import sync_playwright
     for i in range(n):
-        if progress:
-            progress("drawing slide %d of %d" % (i + 1, n))
         s = script["slides"][i]
-        f = get_image(i) if get_image else None
         if s["type"] == "shot" and not any((lookup or (lambda k: None))(x["id"]) for x in s["shots"]):
             raise images.RenderError("Slide %d has no screenshot (it was deleted or not chosen)." % (i + 1))
-        ctx = {"lookup": lookup or (lambda k: None), "out_dir": out_dir, "names": names or {}, "ill": f if s["type"] == "scene" else "",
-               "bg": f if s["type"] == "device" else ""}
-        hp = out_dir / ("_c%d.html" % i)
-        hp.write_text(images.page_html(spec, slide_html(spec, script, i, ctx), w, h), encoding="utf-8")
-        path = out_dir / ("slide_%d.jpg" % (i + 1))
-        with images.LOCK:
-            with sync_playwright() as p:
-                br = p.chromium.launch()
-                try:
-                    pg = br.new_page(viewport={"width": w, "height": h})
-                    pg.goto(images.uri(hp))
-                    pg.wait_for_selector("body[data-ready='1']", timeout=30000)
-                    rep = pg.evaluate(zones.FIT_JS)
-                    png = pg.screenshot(type="png")
-                finally:
-                    br.close()
-        hp.unlink()
-        errs = zones.check_layout(rep)
+        has_bubble = bool(zones.parts(s, spec["cta"])[0])
+        for attempt in range(3):
+            if progress:
+                progress("drawing slide %d of %d%s" % (i + 1, n, (" (redrawing picture, try %d)" % (attempt + 1)) if attempt else ""))
+            f = get_image(i, attempt) if get_image else None
+            if s["type"] == "scene":
+                img = Image.open(f) if f else None
+                heads = vision.head_boxes(img, s["characters"], svg=not f)
+            elif s["type"] == "device":
+                heads = [zones.device_top(s, True)] if has_bubble else []
+            else:
+                heads = []
+            ctx = {"lookup": lookup or (lambda k: None), "out_dir": out_dir, "names": names or {}, "ill": f if s["type"] == "scene" else "",
+                   "bg": f if s["type"] == "device" else "", "heads": heads if s["type"] == "scene" else []}
+            hp = out_dir / ("_c%d.html" % i)
+            hp.write_text(images.page_html(spec, slide_html(spec, script, i, ctx), w, h), encoding="utf-8")
+            with images.LOCK:
+                with sync_playwright() as p:
+                    br = p.chromium.launch()
+                    try:
+                        pg = br.new_page(viewport={"width": w, "height": h})
+                        pg.goto(images.uri(hp))
+                        pg.wait_for_selector("body[data-ready='1']", timeout=30000)
+                        rep = pg.evaluate(zones.FIT_JS)
+                        png = pg.screenshot(type="png")
+                    finally:
+                        br.close()
+            hp.unlink()
+            errs = zones.check_layout(rep, heads)
+            if errs and f and s["type"] == "scene" and attempt < 2 and any(e.startswith("face:") for e in errs):
+                continue                                         # a bubble touched a face: draw the picture again
+            break
         if errs:
-            raise images.RenderError("Slide %d: %s. Shorten the text or change the slide, then Render again." % (i + 1, "; ".join(errs)))
+            raise images.RenderError("Slide %d: %s. Shorten the text or press Regenerate image, then Render again." % (i + 1, "; ".join(e.replace("face: ", "") for e in errs)))
+        path = out_dir / ("slide_%d.jpg" % (i + 1))
         images._save_jpeg_from_png(png, str(path))
         if not path.exists() or path.stat().st_size < 2000:
             raise images.RenderError("Slide %d came out empty." % (i + 1))

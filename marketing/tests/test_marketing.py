@@ -654,7 +654,7 @@ class Cartoon(unittest.TestCase):
         story_routes.ai = lambda *a, **k: self.raw()
         script = self.run_job(self.cl.post("/api/marketing/story/script", json={"brand_id": self.b["id"], "product_id": self.p["id"], "brief": "x", "slides": 3}).get_json()["job"])["result"]
         script["slides"][0]["dialogue"][0]["text"] = HINDI                        # the owner edits a line (Devanagari)
-        r = self.cl.post("/api/marketing/story/render", json={"brand_id": self.b["id"], "product_id": self.p["id"], "script": script, "cta": "Call us"}).get_json()
+        r = self.cl.post("/api/marketing/story/render", json={"brand_id": self.b["id"], "product_id": self.p["id"], "script": script, "cta": "Call us", "imgmode": "svg"}).get_json()
         self.assertTrue(r["ok"], r)
         stages = set()
         for _ in range(600):
@@ -833,7 +833,7 @@ class ImageGen(unittest.TestCase):
         self.assertTrue(s["slides"][-1]["is_cta"])
         self.assertNotIn("hopkeeper2", json.dumps(s["slides"], ensure_ascii=False))
         self.assertIn("Devanagari", s["slides"][0]["claim_note"])
-        self.assertEqual(cartoon.script_prompt("b", None, "X", "Hindi", 3, "", "Call 99999").count("Devanagari"), 1)
+        self.assertGreaterEqual(cartoon.script_prompt("b", None, "X", "Hindi", 3, "", "Call 99999").count("Devanagari"), 1)
         s2 = cartoon.clean_script(d, 3, facts, "Hindi", "")              # no CTA field: nothing is added
         self.assertEqual(len(s2["slides"]), 3)
 
@@ -938,7 +938,7 @@ class Screenshots(unittest.TestCase):
             sl = self.zones.slots(lay, n)
             self.assertEqual(len(sl), n)
             for x, y, w, h in sl:
-                self.assertTrue(0 <= x and 0 <= y and x + w <= self.zones.PIC[2] and y + h <= self.zones.PIC[3])
+                self.assertTrue(0 <= x and 0 <= y and x + w <= self.zones.AREA[0] + self.zones.AREA[2] and y + h <= self.zones.AREA[1] + self.zones.AREA[3])
         s = cartoon.clean_slide({"type": "shot", "shots": [{"id": i} for i in (1, 2, 3, 4, 5, 6)], "layout": "single"})
         self.assertEqual((len(s["shots"]), s["layout"]), (4, "grid"))
         d = cartoon.clean_slide({"type": "device", "shots": [{"id": 1}, {"id": 2}], "device": "crt"})
@@ -1064,43 +1064,102 @@ class Screenshots(unittest.TestCase):
         self.assertTrue(s2["slides"][-1]["is_cta"])
         self.assertNotIn("Call 99999 now", json.dumps(s2["slides"][-1]["dialogue"]))
 
-    def test_zones_never_overlap_by_construction(self):
+    def test_zones_full_picture_layout_constants(self):
         z = self.zones
-        pic_bottom = z.PIC[1] + z.PIC[3]
-        self.assertGreater(z.TXT[1], pic_bottom)                                                                # text zone starts below the picture
-        self.assertGreater(z.TXT[1] + z.TXT[3], z.TXT[1])
-        self.assertLessEqual(z.TXT[1] + z.TXT[3], z.FOOT[1])                                                    # footer strip is its own band
-        self.assertEqual((z.PIC[0], z.PIC[1], z.PIC[2], z.PIC[3]), (0, 0, 1080, 760))                         # picture box on top, full width
-        self.assertEqual(z.TXT[1], z.PIC[3] + 24)
-        self.assertLess(z.TXT[1] + z.TAIL, z.TXT[1] + z.TXT[3])
-        for nb, cap, cta in ((0, False, True), (1, True, False), (2, False, False), (2, True, True)):
-            b = z.budgets(nb, cap, cta)
-            used = b["cta"] + (14 if cta else 0) + b["cap"] + (z.TAIL + b["bub"] * nb + 14 * (nb - 1) if nb else 0) + (14 if nb and cap else 0)
-            self.assertLessEqual(used, z.TXT[3])
+        self.assertEqual((z.W, z.H), (1080, 1350))
+        self.assertAlmostEqual(z.HEADROOM / z.H, 0.35, delta=0.005)                                              # empty headroom band: top 35%
+        self.assertLessEqual(z.BUB_BOTTOM, z.HEADROOM - 20)                                                      # bubbles end above where heads start
+        self.assertLess(z.BAND[1] + z.BAND[3], z.FOOT[1] + 1)                                                    # caption band above the tiny footer
+        self.assertEqual(z.FOOT[1] + z.FOOT[3], z.H)
+        self.assertLessEqual(z.AREA[1] + z.AREA[3], z.BAND[1])                                                   # screenshot area never under the caption band
+        self.assertLessEqual(z.devbox(False)[1] + z.DEVBOX_H, z.BAND[1])
+        self.assertLessEqual(z.devbox(True)[1] + z.DEVBOX_H, z.BAND[1])
+        self.assertGreaterEqual(z.devbox(True)[1], z.HEADROOM - 20)                                              # device sits below the bubbles' band
 
-    def test_check_layout_detects_overlap_and_overflow(self):
+    def test_check_layout_flags_faces_overlap_and_off_band(self):
         z = self.zones
         box = lambda x, y, r, b: {"x": x, "y": y, "r": r, "b": b}
-        pic = box(60, 130, 1020, 830)
-        clean = {"pic": pic, "texts": [{"kind": "bubble", "box": box(60, 878, 600, 1000)}, {"kind": "tail", "box": box(200, 856, 228, 878)},
-                                       {"kind": "footer", "box": box(60, 1250, 1020, 1314)}], "over": [], "zoneFull": False}
-        self.assertEqual(z.check_layout(clean), [])
-        for kind, bad in (("bubble", box(60, 800, 600, 900)), ("tail", box(200, 820, 228, 870)), ("cta", box(100, 700, 900, 820)), ("header", box(60, 100, 1020, 140))):
-            rep = dict(clean, texts=clean["texts"] + [{"kind": kind, "box": bad}])
-            errs = z.check_layout(rep)
-            self.assertTrue(any("overlaps the picture" in e and kind in e for e in errs), (kind, errs))
-        self.assertTrue(z.check_layout(dict(clean, over=["caption"])))
-        self.assertIn("text too long", z.check_layout(dict(clean, over=["caption"]))[0])
-        two = dict(clean, texts=[{"kind": "bubble", "box": box(60, 880, 600, 1000)}, {"kind": "bubble", "box": box(300, 990, 1000, 1100)}])
-        self.assertTrue(any("bubble overlaps bubble" in e for e in z.check_layout(two)))
-        self.assertTrue(z.check_layout(dict(clean, texts=[{"kind": "cta", "box": box(60, 1200, 1200, 1300)}])))   # outside the slide
+        head = box(100, 500, 360, 760)
+        ok = {"texts": [{"kind": "bubble", "box": box(40, 30, 500, 300)}, {"kind": "bubble", "box": box(560, 30, 1040, 300)}, {"kind": "footer", "box": box(0, 1300, 1080, 1350)}], "over": []}
+        self.assertEqual(z.check_layout(ok, [head]), [])
+        touch = {"texts": [{"kind": "bubble", "box": box(40, 300, 500, 520)}], "over": []}                       # bubble reaches into the head
+        errs = z.check_layout(touch, [head])
+        self.assertTrue(any(e.startswith("face:") for e in errs), errs)
+        self.assertIn("bubble is outside the headroom band", errs)                                               # bottom beyond the band
+        two = {"texts": [{"kind": "bubble", "box": box(40, 30, 500, 300)}, {"kind": "bubble", "box": box(300, 200, 760, 420)}], "over": []}
+        self.assertIn("bubble overlaps bubble", z.check_layout(two, []))
+        off = {"texts": [{"kind": "bubble", "box": box(800, 30, 1200, 200)}], "over": []}
+        self.assertIn("bubble is outside the headroom band", z.check_layout(off, []))
+        self.assertTrue(any("text too long" in e for e in z.check_layout(dict(ok, over=["caption"]), [])))
+        cap = {"texts": [{"kind": "caption", "box": box(40, 600, 1000, 690)}], "over": []}
+        self.assertTrue(any(e.startswith("face:") for e in z.check_layout(cap, [head])))
+
+    def test_one_bubble_per_speaker_max_two(self):
+        z = self.zones
+        s = cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}, {"role": "customer", "position": "right"}],
+                                 "dialogue": [{"speaker": "shopkeeper", "text": "एक"}, {"speaker": "shopkeeper", "text": "दो"}]})
+        self.assertEqual([b["text"] for b in z.parts(s)[0]], ["एक दो"])                                         # same speaker: one bubble, no overlap by construction
+        s2 = cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}, {"role": "customer", "position": "right"}],
+                                  "dialogue": [{"speaker": "shopkeeper", "text": "एक"}, {"speaker": "customer", "text": "दो"}]})
+        self.assertEqual(len(z.parts(s2)[0]), 2)
+
+    def test_real_render_bubbles_in_headroom_with_tail_down_and_caption_band(self):
+        ill = pathlib.Path(self.tmp) / "ill.jpg"
+        Image.new("RGB", (1024, 1280), (150, 120, 90)).save(ill)
+        sl = cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}, {"role": "customer", "position": "right"}],
+                                  "dialogue": [{"speaker": "shopkeeper", "text": "भैया, आपका स्टॉक एक जगह दिखेगा"}, {"speaker": "customer", "text": "वाह, बढ़िया है!"}], "narration": "कैप्शन"})
+        script = {"title": "t", "slides": [sl]}
+        seen = {}
+        old = self.zones.check_layout
+
+        def spy(rep, heads=()):
+            seen.update(rep=rep, heads=heads)
+            return old(rep, heads)
+        self.zones.check_layout = spy
+        try:
+            files = cartoon.render_script(script, self.b, self.p, pathlib.Path(self.tmp) / "o", cta="", get_image=lambda i, a: str(ill), names={"shopkeeper": "रमेश", "customer": "मीना"})
+        finally:
+            self.zones.check_layout = old
+        self.assertEqual(Image.open(files[0]).size, (1080, 1350))
+        bub = [t["box"] for t in seen["rep"]["texts"] if t["kind"] == "bubble"]
+        self.assertEqual(len(bub), 2)
+        for b in bub:
+            self.assertTrue(b["y"] >= 24 and b["b"] <= self.zones.BUB_BOTTOM + 1 and b["x"] >= 0 and b["r"] <= 1080)
+            self.assertFalse(any(self.zones.overlap(b, h) for h in seen["heads"]))                               # never over a head
+        self.assertFalse(self.zones.overlap(bub[0], bub[1]))
+        self.assertLess(bub[0]["x"], bub[1]["x"])                                                                # left speaker's bubble is on the left
+        tails = sorted([t["box"] for t in seen["rep"]["texts"] if t["kind"] == "tail"], key=lambda t: t["x"])
+        self.assertEqual(len(tails), 2)
+        for t, h in zip(tails, sorted(seen["heads"], key=lambda h: h["x"])):
+            self.assertLessEqual(t["b"], h["y"])                                                                 # tail ends above the head it points at
+            self.assertGreaterEqual(t["b"] - t["y"], 20)
+        cap = [t for t in seen["rep"]["texts"] if t["kind"] == "caption"]
+        self.assertEqual(len(cap), 1)
+        self.assertGreaterEqual(cap[0]["box"]["y"], self.zones.BAND[1])
+
+    def test_bubble_touching_face_redraws_picture_then_fails_clearly(self):
+        from marketing import vision
+        ill = pathlib.Path(self.tmp) / "ill2.jpg"
+        Image.new("RGB", (1024, 1280), (150, 120, 90)).save(ill)
+        sl = cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}], "dialogue": [{"speaker": "shopkeeper", "text": "नमस्ते"}]})
+        calls = []
+        old = vision.head_boxes
+        vision.head_boxes = lambda img, chars, svg=False: [{"x": 100, "y": 60, "r": 400, "b": 400, "est": False}]        # a face right where the bubble goes
+        try:
+            with self.assertRaises(images.RenderError) as cm:
+                cartoon.render_script({"title": "t", "slides": [sl]}, self.b, self.p, pathlib.Path(self.tmp) / "o2", get_image=lambda i, a: (calls.append(a), str(ill))[1])
+        finally:
+            vision.head_boxes = old
+        self.assertEqual(calls, [0, 1, 2])                                                                      # drawn 3 times: first try + 2 redraws
+        self.assertIn("touches a face", str(cm.exception))
+        self.assertIn("Slide 1", str(cm.exception))
 
     def test_too_long_warning_in_editor(self):
         z = self.zones
         short = cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": "ठीक है"}, {"speaker": "shopkeeper", "text": "ok"}]})
         self.assertEqual(z.too_long(short), "")
         long2 = cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}, {"role": "customer", "position": "right"}],
-                                     "dialogue": [{"speaker": "shopkeeper", "text": "बहुत लंबी बात " * 20}, {"speaker": "customer", "text": "छोटा"}]})
+                                     "dialogue": [{"speaker": "shopkeeper", "text": "बहुत लंबी बात " * 45}, {"speaker": "customer", "text": "छोटा"}]})
         self.assertIn("text too long", z.too_long(long2))
         cap = cartoon.clean_slide({"type": "shot", "shots": [{"id": 1}], "narration": "लंबा कैप्शन " * 60})
         self.assertIn("caption", z.too_long(cap))
@@ -1209,7 +1268,7 @@ class CharacterLibrary(unittest.TestCase):
         self.assertEqual(sorted(files), ["input_image_0", "input_image_1"])                 # first character = input_image_0
         self.assertEqual(files["input_image_0"], pathlib.Path(masters[0]).read_bytes())
         self.assertEqual((fields["width"], fields["height"], fields["prompt"]), (str(self.ig.SCENE_W), str(self.ig.SCENE_H), prompt))
-        self.assertAlmostEqual(self.ig.SCENE_W / self.ig.SCENE_H, 1080 / 760, delta=0.03)   # generated at picture-box proportions
+        self.assertAlmostEqual(self.ig.SCENE_W / self.ig.SCENE_H, 1080 / 1350, delta=0.005)   # generated at the slide proportions (4:5)
         self.assertEqual(self.ig.SCENE_W % 16 + self.ig.SCENE_H % 16, 0)
         again = self.ig.generate_refs(prompt, masters, self.m.env_val, self.conn(), self.settings())
         self.assertTrue(again["cached"])
@@ -1458,6 +1517,205 @@ class Settings(unittest.TestCase):
         self.assertIn("doctor's consultation room", p1)
         self.assertIn("Sunil hands a report to Meena", p2)
         self.assertNotIn("the second shopkeeper", p2)                                         # labels become the character name once
+
+
+def _font():
+    try:
+        from PIL import ImageFont
+        return ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 30)
+    except Exception:
+        return None
+
+
+class Guarantees(unittest.TestCase):
+    """Locked masters block rendering, identity and writing checks with redraws, headroom prompts, Hindi-only text."""
+    PNG = CharacterLibrary.PNG
+    setUp = CharacterLibrary.setUp
+    tearDown = CharacterLibrary.tearDown
+    b64 = CharacterLibrary.b64
+    masters = CharacterLibrary.masters
+    cast = CharacterLibrary.cast
+    slide = CharacterLibrary.slide
+    settings = CharacterLibrary.settings
+    wait = CharacterLibrary.wait
+
+    def png(self, name, color=(120, 80, 60)):
+        f = pathlib.Path(self.tmp) / name
+        Image.new("RGB", (1024, 1280), color).save(f)
+        return f
+
+    # ---- B: masters block ----
+    def test_missing_masters_listed_and_render_blocked_with_link(self):
+        sr = self.sr
+        cast = sr._cast({"id": 1})
+        self.assertEqual(sr.missing_masters([self.slide()], cast), ["Ramesh", "Meena"])
+        self.assertEqual(sr.missing_masters([self.slide()], self.cast()), [])
+        self.assertEqual(sr.missing_masters([cartoon.clean_slide({"type": "shot", "shots": [{"id": 1}]})], cast), [])    # screenshot slides have no characters
+        self.assertIn("/marketing/characters", sr.master_block_message(["Ramesh"]))
+        c = self.m.conn()
+        b = c.execute("SELECT id FROM brands LIMIT 1").fetchone()[0]
+        p = c.execute("SELECT id FROM products LIMIT 1").fetchone()[0]
+        c.close()
+        sr.TOKENS["tk"] = _time.time()
+        script = {"token": "tk", "slides": [dict(self.slide(), dialogue=[{"speaker": "shopkeeper", "text": "नमस्ते"}])]}
+        r = self.cl.post("/api/marketing/story/render", json={"brand_id": b, "product_id": p, "script": script, "imgmode": "ai"}).get_json()
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["link"], "/marketing/characters")
+        self.assertIn("No locked master image", r["error"])
+        self.assertIn("Ramesh", r["error"])
+        r = self.cl.post("/api/marketing/story/image", json={"brand_id": b, "product_id": p, "script": script, "index": 0, "imgmode": "ai"}).get_json()
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["link"], "/marketing/characters")
+        r = self.cl.post("/api/marketing/story/render", json={"brand_id": b, "product_id": p, "script": script, "imgmode": "svg"}).get_json()
+        self.assertTrue(r["ok"])                                                                                     # drawn-parts mode needs no masters
+
+    # ---- B: identity check ----
+    def test_identity_redraws_up_to_three_times_then_flags(self):
+        from marketing import vision
+        sr = self.sr
+        made = []
+
+        def gen(slide, cast, j, ref=None):
+            made.append(slide["img_v"])
+            return {"file": self.png("g%d.png" % len(made)), "provider": "cloudflare-ref"}
+        old = (sr._gen_slide, vision.identity_scores, vision.head_boxes, vision.text_regions)
+        sr._gen_slide = gen
+        vision.head_boxes = lambda img, chars, svg=False: [{"x": 0, "y": 0, "r": 1, "b": 1}] * len(chars)
+        vision.text_regions = lambda img, skip=(): 0
+        try:
+            vision.identity_scores = lambda img, chars, masters: [0.2, 0.9]                                          # always below the minimum
+            r = sr.make_picture(self.slide(), self.cast(), {})
+            self.assertEqual(len(made), 4)                                                                           # 1 + 3 redraws, then give up
+            self.assertEqual((r["id_flag"], r["identity"]), ("check this face", [0.2, 0.9]))
+            self.assertEqual(len(set(made)), 4)                                                                      # every redraw uses another variation
+            made.clear()
+            seq = iter([[0.1, 0.1], [0.3, 0.9], [0.8, 0.9], [0.9, 0.9]])
+            vision.identity_scores = lambda img, chars, masters: next(seq)
+            r = sr.make_picture(self.slide(), self.cast(), {})
+            self.assertEqual((len(made), r["id_flag"]), (3, ""))                                                     # third picture passes
+            made.clear()
+            vision.identity_scores = lambda img, chars, masters: None                                                # model unavailable: no loop, no flag
+            r = sr.make_picture(self.slide(), self.cast(), {})
+            self.assertEqual((len(made), r["id_flag"], r["identity"]), (1, "", []))
+        finally:
+            sr._gen_slide, vision.identity_scores, vision.head_boxes, vision.text_regions = old
+
+    def test_threshold_is_a_setting(self):
+        from marketing import vision
+        self.assertEqual(self.sr.identity_threshold(), vision.IDENTITY_MIN)
+        r = self.cl.post("/api/marketing/identity", json={"min": 0.62}).get_json()
+        self.assertTrue(r["ok"])
+        self.assertAlmostEqual(self.sr.identity_threshold(), 0.62)
+        self.assertFalse(self.cl.post("/api/marketing/identity", json={"min": 3}).get_json()["ok"])
+        self.assertFalse(self.cl.post("/api/marketing/identity", json={"min": "x"}).get_json()["ok"])
+        h = self.cl.get("/marketing/characters").get_data(as_text=True)
+        self.assertIn("Identity check", h)
+        self.assertIn("not a guarantee", h)
+        s = cartoon.clean_slide({"identity": [0.5, 0.7, 0.9], "id_flag": "check this face", "text_flag": 1})
+        self.assertEqual((s["identity"], s["id_flag"], s["text_flag"]), ([0.5, 0.7], "check this face", True))
+
+    @unittest.skipUnless(__import__("os").path.isfile(r"D:\vault\models\clip\vision_model_quantized.onnx"), "CLIP model not installed")
+    def test_clip_embedding_runs_on_cpu_and_orders_similarity(self):
+        import numpy as np
+        from marketing import vision
+        ok, why = vision.available()
+        self.assertTrue(ok, why)
+        rng = np.random.RandomState(1)
+        a = Image.fromarray((rng.rand(256, 256, 3) * 255).astype("uint8"))
+        b = Image.fromarray((np.linspace(0, 255, 256 * 256 * 3).reshape(256, 256, 3)).astype("uint8"))
+        ea, eb = vision.embed(a), vision.embed(b)
+        self.assertEqual(ea.shape, (512,))
+        self.assertAlmostEqual(float(np.dot(ea, ea)), 1.0, places=3)
+        self.assertGreater(float(np.dot(ea, vision.embed(a.transpose(Image.FLIP_LEFT_RIGHT)))), float(np.dot(ea, eb)))     # a flipped copy is closer than another picture
+
+    def test_suggest_threshold_calibration_helper(self):
+        from marketing import vision
+        t, note = vision.suggest_threshold([0.8, 0.85], [0.5, 0.6])
+        self.assertAlmostEqual(t, 0.7)
+        t, note = vision.suggest_threshold([0.56], [0.5, 0.65])
+        self.assertIsNone(t)
+        self.assertIn("overlap", note)
+        self.assertIsNone(vision.suggest_threshold([], [0.5])[0])
+
+    # ---- C: writing in the picture ----
+    @unittest.skipUnless(_font(), "arial not available")
+    def test_text_detection_blank_sign_vs_sign_with_writing(self):
+        from PIL import ImageDraw
+        from marketing import vision
+        im = Image.new("RGB", (1080, 1350), (200, 190, 170))
+        d = ImageDraw.Draw(im)
+        d.rectangle((100, 100, 600, 260), fill=(255, 255, 255), outline=(0, 0, 0))
+        self.assertEqual(vision.text_regions(im), 0)                                                                 # blank sign: nothing found
+        for k, t in enumerate(("PATHOLOGY LAB", "Reports ready", "Open 9 to 6")):
+            d.text((120, 110 + k * 44), t, font=_font(), fill=(0, 0, 0))
+        self.assertGreaterEqual(vision.text_regions(im), 2)
+        self.assertEqual(vision.text_regions(im, skip=[{"x": 90, "y": 90, "r": 620, "b": 280}]), 0)                  # character regions are skipped
+
+    def test_picture_with_writing_is_redrawn_up_to_two_times_then_flagged(self):
+        from marketing import vision
+        sr = self.sr
+        made = []
+
+        def gen(slide, cast, j, ref=None):
+            made.append(1)
+            return {"file": self.png("t%d.png" % len(made)), "provider": "cloudflare-ref"}
+        old = (sr._gen_slide, vision.identity_scores, vision.head_boxes, vision.text_regions)
+        sr._gen_slide = gen
+        vision.head_boxes = lambda img, chars, svg=False: [{"x": 0, "y": 0, "r": 1, "b": 1}] * len(chars)
+        vision.identity_scores = lambda img, chars, masters: [0.9, 0.9]
+        try:
+            vision.text_regions = lambda img, skip=(): 4
+            r = sr.make_picture(self.slide(), self.cast(), {})
+            self.assertEqual((len(made), r["text_flag"]), (3, True))                                                 # 1 + 2 redraws
+            made.clear()
+            seq = iter([5, 0])
+            vision.text_regions = lambda img, skip=(): next(seq)
+            r = sr.make_picture(self.slide(), self.cast(), {})
+            self.assertEqual((len(made), r["text_flag"]), (2, False))
+        finally:
+            sr._gen_slide, vision.identity_scores, vision.head_boxes, vision.text_regions = old
+
+    def test_head_boxes_fallback_from_slots(self):
+        from marketing import vision
+        hb = vision.head_boxes(None, [{"position": "left"}, {"position": "right"}])
+        self.assertTrue(all(h["est"] for h in hb))
+        self.assertLess(hb[0]["x"], hb[1]["x"])
+        for h in hb:
+            self.assertGreaterEqual(h["y"], 0.35 * vision.H)                                                         # heads start below the headroom band
+            self.assertLessEqual(h["b"], 0.6 * vision.H)
+        self.assertGreater(vision.head_boxes(None, [{"position": "center"}], svg=True)[0]["y"], hb[0]["y"])         # drawn parts sit lower
+
+    # ---- C: prompts ----
+    def test_prompts_headroom_blank_paper_no_closeups(self):
+        from marketing import imagegen, places
+        for w in ("top 35 percent", "empty plain headroom band", "lower 65 percent", "at most 50 percent", "Never an extreme close-up", "Blank signboards, blank paper, no letters or writing anywhere"):
+            self.assertIn(w, imagegen.SAFETY)
+        self.assertIn("never a close-up", places.text_of("phone_closeup"))
+        self.assertIn("small prop", places.text_of("phone_closeup"))
+        p, _ = imagegen.ref_scene_prompt(self.slide(), self.cast(), cartoon.SCENES)
+        self.assertIn("Blank signboards, blank paper, no letters or writing anywhere", p)
+        calls = []
+        self.ig.http_post_multipart = lambda url, h, f, files: (calls.append(f), {"result": {"image": self.b64()}})[1]
+        prompt, masters = imagegen.ref_scene_prompt(self.slide(), self.cast(), cartoon.SCENES)
+        imagegen.generate_refs(prompt, masters, self.m.env_val, self.m.conn, self.settings())
+        self.assertEqual((calls[0]["width"], calls[0]["height"]), ("1024", "1280"))
+        s2 = dict(self.slide(), img_v=2)
+        self.assertIn("Variation 2", imagegen.ref_scene_prompt(s2, self.cast(), cartoon.SCENES)[0])                  # a redraw never hits the cache of the last picture
+
+    # ---- C: Hindi only ----
+    def test_hindi_text_has_no_english_words_except_brand_and_product(self):
+        d = {"slides": [{"dialogue": [{"speaker": "shopkeeper", "text": "अब LIMS से sample और रिपोर्ट एक जगह"}]},
+                        {"dialogue": [{"speaker": "shopkeeper", "text": "SFL के साथ सैंपल की रिपोर्ट आसान"}]},
+                        {"dialogue": [{"speaker": "shopkeeper", "text": "सैंपल रिपोर्ट"}]}]}
+        s = cartoon.clean_script(d, 3, "LIMS", "Hindi", "", product_name="LIMS", allowed=["SFL"])
+        self.assertIn("English words in Hindi text", s["slides"][0]["claim_note"])
+        self.assertIn("sample", s["slides"][0]["claim_note"])
+        self.assertNotIn("LIMS", s["slides"][0]["claim_note"].split("(")[1])                                         # product name is allowed
+        self.assertEqual(s["slides"][1]["claim_note"], "")                                                           # brand name is allowed
+        self.assertEqual(s["slides"][2]["claim_note"], "")
+        self.assertEqual(cartoon.latin_words("a b Hindi", ["Hindi"]), ["a", "b"])
+        pr = cartoon.script_prompt("b", None, "X", "Hindi", 3, "", "Call")
+        self.assertIn("EVERY word in Devanagari", pr)
 
 
 if __name__ == "__main__":

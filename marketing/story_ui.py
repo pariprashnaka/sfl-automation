@@ -74,7 +74,7 @@ function imgStatus(){fetch('/api/marketing/story/imgstatus').then(function(r){re
   if($('simg').value=='ai'&&!j.cloudflare)m.push(j.cloudflare_msg+' Until then slides use the drawn parts.');
   if($('shq').checked&&!j.gemini)m.push(j.gemini_msg+' Falls back to the free provider.');
   var u=Object.keys(j.used||{}).map(function(k){return k+' '+j.used[k];}).join(', ');m.push('Images made today: '+(u||'none'));$('imgst').textContent=m.join(' ');}).catch(function(){});}
-function regenImage(i){sync();busy(true);prog('drawing picture for slide '+(i+1));post('/api/marketing/story/image',payload({script:SCRIPT,index:i})).then(function(j){if(!j.ok){prog(j.error,true);return;}
+function regenImage(i){sync();busy(true);prog('drawing picture for slide '+(i+1));post('/api/marketing/story/image',payload({script:SCRIPT,index:i})).then(function(j){if(!j.ok){prog(j.error,true);if(j.link)$('sprog').innerHTML+=" <a href='"+j.link+"'>Open the Characters page</a>";return;}
   poll(j.job,prog,function(r){SCRIPT.slides[r.index]=r.slide;busy(false);prog('Picture for slide '+(r.index+1)+' made by '+r.slide.provider+(r.slide.img_note?' ('+r.slide.img_note+')':'')+'.');drawSlides();imgStatus();});});}
 function busy(on){['swrite','srender'].forEach(function(i){var b=$(i);if(b)b.disabled=on;});}
 function prog(t,bad){var p=$('sprog');p.textContent=t;p.style.color=bad?'var(--bad)':'var(--muted)';if(bad)busy(false);}
@@ -94,6 +94,7 @@ function presetMenu(){var n=(($('product').selectedOptions[0]||{}).textContent||
 function settingOpts(s){return "<option value='custom'"+((!s.setting_key||s.setting_key=='custom')?' selected':'')+">Custom (type at right)</option>"+presetMenu().map(function(k){return "<option value='"+k+"'"+(s.setting_key==k?' selected':'')+">"+OPT.plabels[k]+"</option>";}).join('');}
 function setPreset(i,k){var s=SCRIPT.slides[i];s.setting_key=k;if(k!='custom')s.setting=OPT.ptext[k];drawSlides();}
 function setSetting(i,v){var s=SCRIPT.slides[i];s.setting=v;if(s.setting_key!='custom'&&OPT.ptext[s.setting_key]!=v)s.setting_key='custom';}
+function idBadge(s){var h='';if(s.identity&&s.identity.length)h+=" <span class='chip "+(s.id_flag?'bad':'ok')+"'>identity "+s.identity.join(' / ')+(s.id_flag?' - '+esc(s.id_flag):' ok')+"</span>";if(s.text_flag)h+=" <span class='chip bad'>check for writing in the picture</span>";return h;}
 function sceneBody(s,i){
  var chars=s.characters.map(function(c,k){return "<div class='inl'><select onchange='setc("+i+","+k+",\"role\",this.value)'>"+opts(OPT.roles,c.role)+"</select><select onchange='setc("+i+","+k+",\"expression\",this.value)'>"+arr(OPT.expr,c.expression)+"</select>"+
   "<select onchange='setc("+i+","+k+",\"position\",this.value)'>"+arr(OPT.pos,c.position)+"</select><button type='button' class='grey' onclick='delc("+i+","+k+")'>x</button></div>";}).join('');
@@ -101,7 +102,7 @@ function sceneBody(s,i){
  var roles={};s.characters.forEach(function(c){roles[c.role]=OPT.roles[c.role];});
  var dl=s.dialogue.map(function(d,k){return "<div class='inl'><select style='max-width:160px' onchange='setd("+i+","+k+",\"speaker\",this.value)'>"+opts(roles,d.speaker)+"</select>"+
   "<textarea rows='2' style='flex:3' oninput='setd("+i+","+k+",\"text\",this.value)'>"+esc(d.text)+"</textarea><button type='button' class='grey' onclick='deld("+i+","+k+")'>x</button></div>";}).join('');
- return "<div class='note'>"+(s.image?"<img class='thumb' src='/marketing/img/"+s.image+"'>":"")+(s.provider?"Picture: "+s.provider+(s.provider=='svg'?" (drawn parts)":"")+(s.img_note?" - "+esc(s.img_note):""):"Picture: made when you press Render")+"</div>"+
+ return "<div class='note'>"+(s.image?"<img class='thumb' src='/marketing/img/"+s.image+"'>":"")+(s.provider?"Picture: "+s.provider+(s.provider=='svg'?" (drawn parts)":"")+(s.img_note?" - "+esc(s.img_note):"")+idBadge(s):"Picture: made when you press Render")+"</div>"+
   "<label>Background / setting</label><div class='inl'><select onchange='setPreset("+i+",this.value)'>"+settingOpts(s)+"</select><input style='flex:3' placeholder='Setting in English, e.g. pathology lab bench' value=\""+esc(s.setting||'')+"\" oninput='setSetting("+i+",this.value)'></div>"+
   "<label>What the scene shows (English only: action and props)</label><input value=\""+esc(s.description)+"\" oninput='sets("+i+",\"description\",this.value)'>"+
   "<label>Characters, expression, position</label>"+chars+(s.characters.length<2?"<button type='button' class='grey' onclick='addc("+i+")'>+ character</button>":"")+
@@ -184,9 +185,9 @@ function delSlide(i){if(SCRIPT.slides.length<=1){return;}SCRIPT.slides.splice(i,
 function regenSlide(i){sync();busy(true);prog('rewriting slide '+(i+1));post('/api/marketing/story/slide',payload({script:SCRIPT,index:i})).then(function(j){if(!j.ok){prog(j.error,true);return;}
   poll(j.job,prog,function(r){SCRIPT.slides[r.index]=r.slide;busy(false);prog('Slide '+(r.index+1)+' rewritten.');drawSlides();});});}
 function renderStory(){sync();if(!SCRIPT){return;}busy(true);prog('starting render');
- post('/api/marketing/story/render',payload({script:SCRIPT})).then(function(j){if(!j.ok){prog(j.error,true);return;}
+ post('/api/marketing/story/render',payload({script:SCRIPT})).then(function(j){if(!j.ok){prog(j.error,true);if(j.link)$('sprog').innerHTML+=" <a href='"+j.link+"'>Open the Characters page</a>";return;}
   poll(j.job,prog,function(r){RENDERED=true;busy(false);prog('Rendered '+r.images.length+' slides. Click a picture to enlarge.'+(r.added_cta?' A call-to-action slide was added.':''));TOKEN=r.token;
-   if(r.slides){SCRIPT.slides=r.slides;drawSlides();}$('provs').textContent='Pictures by slide: '+(r.slides||[]).map(function(s,k){return (k+1)+' '+(s.provider||'svg')+(s.provider=='svg'&&s.img_note?' ('+s.img_note+')':'');}).join(' | ');imgStatus();LAST={spec:SCRIPT,tiers:SCRIPT.tiers||{}};
+   if(r.slides){SCRIPT.slides=r.slides;drawSlides();}$('provs').innerHTML='Pictures by slide: '+(r.slides||[]).map(function(s,k){return (k+1)+' '+(s.provider||'svg')+(s.provider=='svg'&&s.img_note?' ('+esc(s.img_note)+')':'')+idBadge(s);}).join(' | ')+"<div class='note'>Identity score and the writing check are best-effort filters on this laptop, not a guarantee: always look at the faces before posting.</div>";imgStatus();LAST={spec:SCRIPT,tiers:SCRIPT.tiers||{}};
    $('result').style.display='block';$('imgs').innerHTML=r.images.map(function(u){return "<img class='pv' style='max-width:200px;margin:0 10px 10px 0' src='"+u+"?t="+Date.now()+"'>"}).join('');
    $('caption').value=SCRIPT.caption||'';$('hashtags').value=SCRIPT.hashtags||'';$('alt').value=SCRIPT.alt||'';$('notes').textContent='Hashtags are suggested; popularity is not verified.';drawTags();
    $('result').scrollIntoView({behavior:'smooth'});});});}
