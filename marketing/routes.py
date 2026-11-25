@@ -265,5 +265,5 @@ def register(mod):
     c = mod.conn()
     mdb.ensure(c)
     c.close()
-    from . import create, queue        # noqa: F401  (adds their routes to the blueprint)
+    from . import create, queue, story_routes        # noqa: F401  (adds their routes to the blueprint)
     mod.app.register_blueprint(bp)

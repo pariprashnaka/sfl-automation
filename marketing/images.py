@@ -318,29 +318,6 @@ def _pillow_slide(s, path):
     im.save(path, "JPEG", quality=90)
 
 
-def cartoon_available():
-    base = pathlib.Path(__file__).resolve().parent
-    return (base / "render_story.py").exists() and (base / "sample_story.json").exists()
-
-
-def render_cartoon(spec, out_dir):
-    """Optional cartoon story carousel: only when marketing/render_story.py and sample_story.json exist."""
-    base = pathlib.Path(__file__).resolve().parent
-    data = json.loads((base / "sample_story.json").read_text(encoding="utf-8"))
-    for k in ("title", "topic", "headline"):
-        if k in data:
-            data[k] = spec["headline"]
-    sp = pathlib.Path(out_dir) / "story_spec.json"
-    sp.write_text(json.dumps(data), encoding="utf-8")
-    py = pathlib.Path(sys.executable).with_name("python.exe")
-    r = subprocess.run([str(py if py.exists() else sys.executable), str(base / "render_story.py"), str(sp), str(out_dir)],
-                       capture_output=True, text=True, timeout=300, creationflags=0x08000000)
-    files = sorted(str(p) for p in pathlib.Path(out_dir).glob("*.jpg"))
-    if r.returncode != 0 or not files:
-        raise RenderError("Cartoon story renderer failed.")
-    return files
-
-
 def render(spec, out_dir):
     """Render the spec to JPEG file(s) in out_dir. Returns {"files":[...], "warning":""}. Raises RenderError with a plain message."""
     msg = ram_message()

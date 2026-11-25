@@ -550,5 +550,136 @@ class Stage5Service(unittest.TestCase):
         self.assertIn("Missing settings", msg)
 
 
+from marketing import cartoon, story_routes
+import time as _time
+
+HINDI = "दुकानदार का माल ख़राब हो गया"
+
+
+class Cartoon(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (mdb.ASSETS, mdb.OUT_ROOT)
+        mdb.ASSETS = pathlib.Path(self.tmp) / "assets"
+        mdb.OUT_ROOT = pathlib.Path(self.tmp) / "out"
+        self._ram = images.free_ram_mb
+        images.free_ram_mb = lambda: 4000
+        self.m = make_app(self.tmp)
+        self.c = self.m.conn()
+        self.b = self.c.execute("SELECT * FROM brands WHERE name='SFL'").fetchone()
+        self.p = self.c.execute("SELECT * FROM products WHERE name='InventoryCloud'").fetchone()
+        self.cl = self.m.app.test_client()
+        self._ai = story_routes.ai
+
+    def tearDown(self):
+        story_routes.ai = self._ai
+        images.free_ram_mb = self._ram
+        mdb.ASSETS, mdb.OUT_ROOT = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def raw(self, text="Stock ka hisaab ek jagah"):
+        return json.dumps({"title": "T", "caption": "cap", "alt": "alt", "hashtags": {"broad": ["#Business"], "niche": ["#Stock"], "local": ["#Buxar"]},
+                           "slides": [{"scene": "shelves", "description": "d", "characters": [{"role": "shopkeeper", "expression": "worried", "position": "left"},
+                                                                                              {"role": "customer", "expression": "happy", "position": "right"}],
+                                       "props": ["boxes", "calendar", "question"], "dialogue": [{"speaker": "shopkeeper", "text": text}], "narration": "n"}] * 3})
+
+    def run_job(self, jid):
+        for _ in range(100):
+            j = story_routes.JOBS[jid]
+            if j["state"] != "running":
+                return j
+            _time.sleep(0.1)
+        self.fail("job did not finish")
+
+    def test_parts_combine_and_unknown_values_fall_back(self):
+        s = cartoon.clean_slide({"scene": "moon", "characters": [{"role": "ghost", "expression": "??", "position": "up"}] * 3,
+                                 "props": ["tablet", "nope", "phone", "boxes", "calendar", "coin"], "dialogue": [{"speaker": "x", "text": "hi"}] * 3})
+        self.assertEqual(s["scene"], "shop_counter")
+        self.assertEqual(len(s["characters"]), 2)
+        self.assertEqual({c["position"] for c in s["characters"]}, {"left", "right"})
+        self.assertEqual(len(s["props"]), 4)
+        self.assertNotIn("nope", s["props"])
+        self.assertEqual(len(s["dialogue"]), 2)
+        svg = cartoon.scene_svg(s)
+        self.assertTrue(svg.startswith("<svg") and svg.endswith("</svg>"))
+        for sc in cartoon.SCENES:
+            for ex in cartoon.EXPRESSIONS:
+                for pr in cartoon.PROPS:
+                    self.assertIn("<svg", cartoon.scene_svg({"scene": sc, "characters": [{"role": "customer", "expression": ex, "position": "left"}], "props": [pr], "dialogue": []}))
+
+    def test_claim_note_for_claims_not_in_product(self):
+        facts = cartoon.product_facts(self.p)
+        ok = cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": "Stock in one place"}]})
+        self.assertEqual(cartoon.claim_flags(ok, facts), "")
+        for txt in ("Save 40% every month", "100% guaranteed", "Only 99 rupees"):
+            bad = cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": txt}]})
+            self.assertTrue(cartoon.claim_flags(bad, facts), txt)
+        ai_flag = cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": "ok"}], "unsupported_claim": "expiry alerts"})
+        self.assertTrue(cartoon.claim_flags(ai_flag, facts))
+        s = cartoon.clean_script(json.loads(self.raw("Save 40% on stock")), 3, facts)
+        self.assertTrue(all("claim not in product details" in x["claim_note"] for x in s["slides"]))
+
+    def test_script_job_and_two_step_gate(self):
+        story_routes.ai = lambda task, prompt, **k: (self.assertEqual(task, "marketing_story"), self.assertIn("PRODUCT FACTS", prompt),
+                                                   self.assertIn("exactly 4 slides", prompt), self.raw())[3]
+        r = self.cl.post("/api/marketing/story/script", json={"brand_id": self.b["id"], "product_id": self.p["id"], "brief": "do dukandaar baat kar rahe hain", "slides": 4, "language": "Hinglish"}).get_json()
+        self.assertTrue(r["ok"])
+        j = self.run_job(r["job"])
+        self.assertEqual(j["state"], "done", j["error"])
+        script = j["result"]
+        self.assertTrue(script["token"])
+        self.assertTrue(12 <= len(script["hashtags"].split()) <= 15)
+        # empty brief refused; render without a server-issued script refused
+        self.assertFalse(self.cl.post("/api/marketing/story/script", json={"brand_id": self.b["id"], "brief": " "}).get_json()["ok"])
+        bad = self.cl.post("/api/marketing/story/render", json={"brand_id": self.b["id"], "script": {"slides": script["slides"], "token": "forged"}}).get_json()
+        self.assertFalse(bad["ok"])
+        self.assertFalse(self.cl.post("/api/marketing/story/render", json={"brand_id": self.b["id"], "script": {"slides": script["slides"]}}).get_json()["ok"])
+
+    def test_bad_ai_answer_is_a_clear_error(self):
+        story_routes.ai = lambda *a, **k: "not json"
+        r = self.cl.post("/api/marketing/story/script", json={"brand_id": self.b["id"], "brief": "x"}).get_json()
+        j = self.run_job(r["job"])
+        self.assertEqual(j["state"], "error")
+        self.assertIn("could not be read", j["error"])
+
+    def test_regenerate_one_slide(self):
+        story_routes.ai = lambda *a, **k: self.raw()
+        script = self.run_job(self.cl.post("/api/marketing/story/script", json={"brand_id": self.b["id"], "product_id": self.p["id"], "brief": "x"}).get_json()["job"])["result"]
+        story_routes.ai = lambda task, prompt, **k: json.dumps({"scene": "plain", "characters": [{"role": "customer", "expression": "surprised"}], "dialogue": [{"speaker": "customer", "text": "naya"}]})
+        r = self.cl.post("/api/marketing/story/slide", json={"brand_id": self.b["id"], "product_id": self.p["id"], "script": script, "index": 1}).get_json()
+        out = self.run_job(r["job"])["result"]
+        self.assertEqual((out["index"], out["slide"]["scene"], out["slide"]["dialogue"][0]["text"]), (1, "plain", "naya"))
+
+    def test_render_uses_script_as_written_hindi_and_progress(self):
+        story_routes.ai = lambda *a, **k: self.raw()
+        script = self.run_job(self.cl.post("/api/marketing/story/script", json={"brand_id": self.b["id"], "product_id": self.p["id"], "brief": "x", "slides": 3}).get_json()["job"])["result"]
+        script["slides"][0]["dialogue"][0]["text"] = HINDI                        # the owner edits a line (Devanagari)
+        r = self.cl.post("/api/marketing/story/render", json={"brand_id": self.b["id"], "product_id": self.p["id"], "script": script, "cta": "Call us"}).get_json()
+        self.assertTrue(r["ok"], r)
+        stages = set()
+        for _ in range(600):
+            j = story_routes.JOBS[r["job"]]
+            stages.add(j["stage"])
+            if j["state"] != "running":
+                break
+            _time.sleep(0.2)
+        self.assertEqual(j["state"], "done", j["error"])
+        self.assertTrue(any(s.startswith("drawing slide") for s in stages | {j["stage"]}))
+        self.assertEqual(len(j["result"]["images"]), 3)
+        tok = j["result"]["token"]
+        for k in (1, 2, 3):
+            f = mdb.OUT_ROOT / ("p_" + tok) / ("slide_%d.jpg" % k)
+            self.assertEqual(Image.open(f).size, (1080, 1350))
+            self.assertLess(f.stat().st_size, 8 * 1024 * 1024)
+        self.assertEqual(self.cl.get(j["result"]["images"][0]).status_code, 200)
+
+    def test_create_page_has_cartoon_ui(self):
+        h = self.cl.get("/marketing/create").get_data(as_text=True)
+        for needle in ("Describe the story you want", "Load example", "Cartoon story carousel", "id='lb' hidden", ".lb[hidden]{display:none!important}"):
+            self.assertIn(needle, h)
+        self.assertNotIn("Expiry wastage", h)
+        self.assertIn("do dukandaar baat kar rahe hain", h)                    # only inside the Load example text
+
+
 if __name__ == "__main__":
     unittest.main()

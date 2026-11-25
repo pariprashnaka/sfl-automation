@@ -23,7 +23,7 @@ CONFIG = {
     "cool_first": 600, "cool_max": 7200,
     # Which Groq model size each task type uses (edit here). 'small' = higher-limit 8B for simple yes/no and extraction;
     # 'large' = drafts and anything ambiguous. Unlisted tasks use "default". Small falls back to large if it fails.
-    "task_size": {"relevant": "small", "extract": "small", "profile": "small", "marketing_caption": "small", "default": "large"},
+    "task_size": {"relevant": "small", "extract": "small", "profile": "small", "marketing_caption": "small", "marketing_story": "large", "default": "large"},
     "cache_tasks": ["relevant", "marketing_caption"],         # identical prompts for these tasks are answered from SQLite for cache_ttl seconds
     "cache_ttl": 86400,
     # Circuit breaker: quota/429 -> provider off until its daily reset (if the error says daily) or cool_quota seconds;

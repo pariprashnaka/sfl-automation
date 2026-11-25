@@ -27,8 +27,9 @@ function gen(){say('Working... this can take up to a minute on this laptop.');$(
   $('imgs').innerHTML=j.images.map(function(u){return "<img class='pv' style='max-width:260px;margin:0 10px 10px 0' src='"+u+"?t="+Date.now()+"'>"}).join('');
   $('caption').value=j.caption||'';$('hashtags').value=j.hashtags||'';$('alt').value=j.alt||'';$('notes').textContent=j.notes||'';drawTags();
  }).catch(function(){$('gen').disabled=false;say('Request failed',true);});}
+function isCartoonSave(){return $('type').value=='cartoon';}
 function saveDraft(){fetch('/api/marketing/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,brand_id:$('brand').value,product_id:$('product').value,
-  platforms:plats(),type:$('type').value,template:$('template').value,topic:$('topic').value,caption:$('caption').value,hashtags:$('hashtags').value,alt:$('alt').value,spec:LAST&&LAST.spec})})
+  platforms:plats(),type:isCartoonSave()?'carousel':$('type').value,template:isCartoonSave()?'cartoon':$('template').value,topic:isCartoonSave()?($('stitle').value||'Cartoon story'):$('topic').value,caption:$('caption').value,hashtags:$('hashtags').value,alt:$('alt').value,spec:LAST&&LAST.spec})})
  .then(function(r){return r.json()}).then(function(j){if(j.ok){location.href='/marketing/queue?m=Saved+as+draft+%23'+j.id;}else{say(j.error,true);}});}
 $('brand').onchange=fillProducts;fillProducts();$('hashtags').oninput=drawTags;
 </script>"""
@@ -48,7 +49,7 @@ def create_page():
     body = flash() + (
         "<div class='card'><div class='row'><div><label>Brand</label><select id='brand'>%s</select></div><div><label>Product</label><select id='product'></select></div>"
         "<div><label>Type</label><select id='type'><option value='post'>Post 1080x1350</option><option value='carousel'>Carousel slides 1080x1350</option>"
-        "<option value='story'>Story 1080x1920</option></select></div><div><label>Template</label><select id='template'>%s</select></div></div>"
+        "<option value='story'>Story 1080x1920</option><option value='cartoon'>Cartoon story carousel</option></select></div><div><label>Template</label><select id='template'>%s</select></div></div>"
         "<div class='row'><div style='flex:2'><label>Topic</label><input id='topic' placeholder='e.g. Know your stock at a glance'></div>"
         "<div><label>Tone</label><select id='tone'><option>Friendly</option><option>Professional</option><option>Hinglish friendly</option></select></div>"
         "<div><label>Call to action (optional)</label><input id='cta' placeholder='e.g. Message us for a demo'></div></div>"
@@ -60,7 +61,8 @@ def create_page():
         "<label>Hashtags <span class='note'>(suggested, popularity not verified)</span></label><div id='tagchips' style='margin:6px 0'></div><textarea id='hashtags' rows='2'></textarea>"
         "<label>Alt-text description</label><textarea id='alt' rows='2'></textarea><div id='notes' class='note'></div>"
         "<div style='margin-top:12px'><button type='button' onclick='saveDraft()'>Save as draft</button> <button type='button' class='grey' onclick='gen()'>Regenerate</button></div></div>") % (bo, to)
-    return page("/marketing/create", STYLE + body + CREATE_JS.replace("__BRANDS__", json.dumps({"products": prods})), "Create")
+    from . import story_ui
+    return page("/marketing/create", STYLE + story_ui.STYLE + body + story_ui.panel() + CREATE_JS.replace("__BRANDS__", json.dumps({"products": prods})) + story_ui.js(), "Create")
 
 
 def cleanup_previews():
