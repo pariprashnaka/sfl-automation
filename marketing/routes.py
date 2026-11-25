@@ -248,9 +248,11 @@ def asset_file(brand, name):
     return send_file(str(p))
 
 
-@bp.route("/marketing/out/<int:pid>/<name>")
+@bp.route("/marketing/out/<pid>/<name>")
 def out_file(pid, name):
-    base = (mdb.OUT_ROOT / str(pid)).resolve()
+    if not re.fullmatch(r"[A-Za-z0-9_]+", pid):
+        abort(404)
+    base = (mdb.OUT_ROOT / pid).resolve()
     p = (base / name).resolve()
     if base not in p.parents or not p.is_file() or p.suffix.lower() not in (".jpg", ".jpeg"):
         abort(404)
@@ -263,4 +265,5 @@ def register(mod):
     c = mod.conn()
     mdb.ensure(c)
     c.close()
+    from . import create, queue        # noqa: F401  (adds their routes to the blueprint)
     mod.app.register_blueprint(bp)
