@@ -1,6 +1,6 @@
 """HTML/JS for the Cartoon story panel on the Create page, plus the lightbox used by every preview."""
 import json
-from . import cartoon, shotslides, shots
+from . import cartoon, shotslides, shots, places
 
 EXAMPLE = "do dukandaar baat kar rahe hain, ek ka maal expire hota hai, dusra solution batata hai"
 
@@ -89,6 +89,11 @@ function sync(){SCRIPT.title=$('stitle').value;SCRIPT.caption=$('scap').value;SC
 var SHOTS=[],PENDING=null,CHKT=null,RENDERED=false;
 function shotInfo(id){return (SHOTS||[]).filter(function(x){return x.id==id})[0]||null;}
 function hlStyle(h){return h?"left:"+(h.x*100)+"%;top:"+(h.y*100)+"%;width:"+(h.w*100)+"%;height:"+(h.h*100)+"%":"display:none";}
+function presetMenu(){var n=(($('product').selectedOptions[0]||{}).textContent||'').toLowerCase();var fam=n.indexOf('lims')>=0?'lims':n.indexOf('hms')>=0?'hms':n.indexOf('inventory')>=0?'inventory':'generic';
+ var first=OPT.fam[fam]||OPT.fam.generic,keys=first.concat(Object.keys(OPT.plabels)),seen={};return keys.filter(function(k){if(seen[k])return false;seen[k]=1;return true;});}
+function settingOpts(s){return "<option value='custom'"+((!s.setting_key||s.setting_key=='custom')?' selected':'')+">Custom (type at right)</option>"+presetMenu().map(function(k){return "<option value='"+k+"'"+(s.setting_key==k?' selected':'')+">"+OPT.plabels[k]+"</option>";}).join('');}
+function setPreset(i,k){var s=SCRIPT.slides[i];s.setting_key=k;if(k!='custom')s.setting=OPT.ptext[k];drawSlides();}
+function setSetting(i,v){var s=SCRIPT.slides[i];s.setting=v;if(s.setting_key!='custom'&&OPT.ptext[s.setting_key]!=v)s.setting_key='custom';}
 function sceneBody(s,i){
  var chars=s.characters.map(function(c,k){return "<div class='inl'><select onchange='setc("+i+","+k+",\"role\",this.value)'>"+opts(OPT.roles,c.role)+"</select><select onchange='setc("+i+","+k+",\"expression\",this.value)'>"+arr(OPT.expr,c.expression)+"</select>"+
   "<select onchange='setc("+i+","+k+",\"position\",this.value)'>"+arr(OPT.pos,c.position)+"</select><button type='button' class='grey' onclick='delc("+i+","+k+")'>x</button></div>";}).join('');
@@ -97,7 +102,8 @@ function sceneBody(s,i){
  var dl=s.dialogue.map(function(d,k){return "<div class='inl'><select style='max-width:160px' onchange='setd("+i+","+k+",\"speaker\",this.value)'>"+opts(roles,d.speaker)+"</select>"+
   "<textarea rows='2' style='flex:3' oninput='setd("+i+","+k+",\"text\",this.value)'>"+esc(d.text)+"</textarea><button type='button' class='grey' onclick='deld("+i+","+k+")'>x</button></div>";}).join('');
  return "<div class='note'>"+(s.image?"<img class='thumb' src='/marketing/img/"+s.image+"'>":"")+(s.provider?"Picture: "+s.provider+(s.provider=='svg'?" (drawn parts)":"")+(s.img_note?" - "+esc(s.img_note):""):"Picture: made when you press Render")+"</div>"+
-  "<label>Scene</label><select onchange='sets("+i+",\"scene\",this.value)'>"+opts(OPT.scenes,s.scene)+"</select><label>What the scene shows (English, picture only)</label><input value=\""+esc(s.description)+"\" oninput='sets("+i+",\"description\",this.value)'>"+
+  "<label>Background / setting</label><div class='inl'><select onchange='setPreset("+i+",this.value)'>"+settingOpts(s)+"</select><input style='flex:3' placeholder='Setting in English, e.g. pathology lab bench' value=\""+esc(s.setting||'')+"\" oninput='setSetting("+i+",this.value)'></div>"+
+  "<label>What the scene shows (English only: action and props)</label><input value=\""+esc(s.description)+"\" oninput='sets("+i+",\"description\",this.value)'>"+
   "<label>Characters, expression, position</label>"+chars+(s.characters.length<2?"<button type='button' class='grey' onclick='addc("+i+")'>+ character</button>":"")+
   "<label>Props</label><div class='props'>"+props+"</div><label>Dialogue</label>"+dl+(s.dialogue.length<2?"<button type='button' class='grey' onclick='addd("+i+")'>+ line</button>":"")+
   "<label>Narration (optional line below the picture)</label><input value=\""+esc(s.narration)+"\" oninput='setn("+i+",this.value)'>";}
@@ -173,7 +179,7 @@ function setp(i,p,on){var a=SCRIPT.slides[i].props,x=a.indexOf(p);if(on&&x<0&&a.
 function setd(i,k,f,v){SCRIPT.slides[i].dialogue[k][f]=v;}
 function deld(i,k){SCRIPT.slides[i].dialogue.splice(k,1);drawSlides();}
 function addd(i){var s=SCRIPT.slides[i];s.dialogue.push({speaker:s.characters[0].role,text:''});drawSlides();}
-function addSlide(i,t){if(SCRIPT.slides.length>=10){prog('At most 10 slides.',true);return;}t=t||'scene';var n={scene:'shop_counter',description:'',characters:[{role:'shopkeeper',expression:'neutral',position:'center'}],props:[],dialogue:t=='scene'?[{speaker:'shopkeeper',text:''}]:[],narration:'',claim_note:'',type:t,shots:[],layout:'single',device:'tablet',bg:'gradient'};SCRIPT.slides.splice(i+1,0,n);drawSlides();}
+function addSlide(i,t){if(SCRIPT.slides.length>=10){prog('At most 10 slides.',true);return;}t=t||'scene';var n={scene:'shop_counter',setting_key:'',setting:'',description:'',characters:[{role:'shopkeeper',expression:'neutral',position:'center'}],props:[],dialogue:t=='scene'?[{speaker:'shopkeeper',text:''}]:[],narration:'',claim_note:'',type:t,shots:[],layout:'single',device:'tablet',bg:'gradient'};SCRIPT.slides.splice(i+1,0,n);drawSlides();}
 function delSlide(i){if(SCRIPT.slides.length<=1){return;}SCRIPT.slides.splice(i,1);drawSlides();}
 function regenSlide(i){sync();busy(true);prog('rewriting slide '+(i+1));post('/api/marketing/story/slide',payload({script:SCRIPT,index:i})).then(function(j){if(!j.ok){prog(j.error,true);return;}
   poll(j.job,prog,function(r){SCRIPT.slides[r.index]=r.slide;busy(false);prog('Slide '+(r.index+1)+' rewritten.');drawSlides();});});}
@@ -196,5 +202,5 @@ $('type').addEventListener('change',toggleType);toggleType();imgStatus();
 
 
 def js():
-    opt = {"types": shotslides.TYPES, "layouts": shotslides.LAYOUTS, "devices": shotslides.DEVICES, "bgs": shotslides.BGS, "roles": cartoon.ROLES, "scenes": cartoon.SCENES, "props": cartoon.PROPS, "expr": cartoon.EXPRESSIONS, "pos": cartoon.POSITIONS}
+    opt = {"types": shotslides.TYPES, "layouts": shotslides.LAYOUTS, "devices": shotslides.DEVICES, "bgs": shotslides.BGS, "roles": cartoon.ROLES, "plabels": {k: v[0] for k, v in places.PRESETS.items()}, "ptext": {k: v[1] for k, v in places.PRESETS.items()}, "fam": dict(places.FAMILIES, generic=places.GENERIC), "props": cartoon.PROPS, "expr": cartoon.EXPRESSIONS, "pos": cartoon.POSITIONS}
     return JS.replace("__OPT__", json.dumps(opt)).replace("__EX__", json.dumps(EXAMPLE))

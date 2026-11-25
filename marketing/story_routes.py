@@ -66,7 +66,7 @@ def write_script(b, p, j, set_stage):
             last = ex
     else:
         raise ValueError("The AI answer could not be read. Press Write script again.")
-    script = cartoon.clean_script(d, n, cartoon.product_facts(p), _lang(j), j.get("cta") or "")
+    script = cartoon.clean_script(d, n, cartoon.product_facts(p), _lang(j), j.get("cta") or "", product_name=p["name"] if p else "")
     tags = hashtags.build(script.pop("hashtags_raw"))
     script["hashtags"] = hashtags.as_text(tags)
     script["tiers"] = hashtags.tier_map(tags)
@@ -105,6 +105,9 @@ def api_story_slide():
         except Exception:
             raise ValueError("The AI answer could not be read. Press Regenerate again.")
         s = cartoon.clean_slide(d)
+        if not s["setting"]:                                   # keep the place of the slide being replaced
+            old = script["slides"][i]
+            s["setting_key"], s["setting"] = old.get("setting_key", ""), old.get("setting", "")
         note = cartoon.claim_flags(s, cartoon.product_facts(p))
         s["claim_note"] = "claim not in product details - confirm before posting" if note else ""
         return {"index": i, "slide": s}

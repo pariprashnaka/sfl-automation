@@ -4,7 +4,7 @@ the story, dialogue and claims all come from the script (written by the AI from 
 No known or copied characters: every shape below is drawn from simple primitives.
 """
 import json, re, pathlib
-from . import images, imagegen, shotslides, zones
+from . import images, imagegen, shotslides, zones, places
 
 SCENES = {"shop_counter": "Shop counter", "shelves": "Shelves behind a counter", "shop_front": "Shop front", "plain": "Plain background"}
 ROLES = {"shopkeeper": "Shopkeeper", "shopkeeper2": "Second shopkeeper", "customer": "Customer"}
@@ -184,7 +184,7 @@ def blank_slide():
     return {"scene": "shop_counter", "description": "", "characters": [{"role": "shopkeeper", "expression": "neutral", "position": "left"}],
             "props": [], "dialogue": [{"speaker": "shopkeeper", "text": ""}], "narration": "", "claim_note": "", "is_cta": False,
             "image": "", "provider": "", "img_v": 0, "img_note": "",
-            "type": "scene", "shots": [], "layout": "single", "device": "tablet", "bg": "gradient"}
+            "type": "scene", "shots": [], "layout": "single", "device": "tablet", "bg": "gradient", "setting_key": "", "setting": ""}
 
 
 def clean_slide(s):
@@ -213,13 +213,19 @@ def clean_slide(s):
             if t:
                 dlg.append({"speaker": d.get("speaker") if d.get("speaker") in roles else roles[0], "text": t})
     props = [p for p in (s.get("props") or []) if p in PROPS][:4]
+    raw = str(s.get("setting") or "").strip()
+    key = raw if raw in places.PRESETS else (s.get("setting_key") if s.get("setting_key") in places.PRESETS else "")
+    setting = places.text_of(raw) if raw in places.PRESETS else (places.english_only(raw) or places.text_of(key))
+    if setting and not key:
+        key = "custom"
     typ = s.get("type") if s.get("type") in shotslides.TYPES else "scene"
     if typ == "shot":
         dlg = []                                           # screenshot slides carry a caption (narration), no speech bubbles
     elif typ == "device":
         dlg = dlg[:1]
     extra = shotslides.slide_fields(s, typ)
-    return dict(extra, **{"scene": s.get("scene") if s.get("scene") in SCENES else "shop_counter", "description": imagegen.scrub(s.get("description")),
+    scene = places.SVG_FOR.get(key) if key in places.SVG_FOR else (s.get("scene") if s.get("scene") in SCENES else "shop_counter")
+    return dict(extra, **{"scene": scene, "setting_key": key, "setting": setting, "description": places.english_only(imagegen.scrub(s.get("description"))),
             "characters": chars, "props": props, "dialogue": dlg, "narration": imagegen.scrub(s.get("narration")),
             "claim_note": str(s.get("unsupported_claim") or s.get("claim_note") or "").strip(), "is_cta": bool(s.get("is_cta")),
             "image": imagegen.safe_name(s.get("image")) or "", "provider": s.get("provider") if s.get("provider") in PROVIDER_SET else "",
@@ -268,7 +274,8 @@ def ensure_cta(slides, cta):
         last["is_cta"] = True
         return False
     ch = dict(last["characters"][0], expression="happy", position="center")
-    new = clean_slide({"scene": "shop_counter", "description": "the shopkeeper smiles warmly at the viewer and invites them in", "characters": [ch],
+    new = clean_slide({"scene": last["scene"], "setting_key": last.get("setting_key"), "setting": last.get("setting"),
+                       "description": "the shopkeeper smiles warmly at the viewer and invites them in", "characters": [ch],
                        "props": [], "dialogue": [], "narration": ""})
     new["is_cta"] = True
     if len(slides) >= MAX_SLIDES:
@@ -290,11 +297,16 @@ def drop_cta_text(slides, cta):
                 s["narration"] = ""
 
 
-def clean_script(d, n, facts, lang="", cta="", notes=None):
+def clean_script(d, n, facts, lang="", cta="", notes=None, product_name=""):
     d = d if isinstance(d, dict) else {}
     slides = [clean_slide(s) for s in (d.get("slides") or [])][:MAX_SLIDES]
     if not slides:
         raise ValueError("The AI returned no slides.")
+    for k, s in enumerate(slides):
+        if s["type"] == "scene" and not s["setting"]:           # the AI gave no usable English setting: a place that fits the product
+            key = places.default_for(product_name, k)
+            s["setting_key"], s["setting"] = key, places.text_of(key)
+            s["scene"] = places.SVG_FOR.get(key, s["scene"])
     for s in slides:
         note = claim_flags(s, slide_facts(s, facts, notes))
         s["claim_note"] = "claim not in product details - confirm before posting" if note else ""
@@ -307,11 +319,11 @@ def clean_script(d, n, facts, lang="", cta="", notes=None):
 
 
 def parts_text():
-    return ("scene: %s\nrole: %s\nexpression: %s\nposition: %s\nprops: %s" % (
-        " | ".join(SCENES), " | ".join(ROLES), " | ".join(EXPRESSIONS), " | ".join(POSITIONS), " | ".join(PROPS)))
+    return ("role: %s\nexpression: %s\nposition: %s\nprops: %s" % (
+        " | ".join(ROLES), " | ".join(EXPRESSIONS), " | ".join(POSITIONS), " | ".join(PROPS)))
 
 
-SHAPE = ('{"title":"", "caption":"", "alt":"", "hashtags":{"broad":[],"niche":[],"local":[]}, "slides":[{"scene":"", "description":"what the scene shows", '
+SHAPE = ('{"title":"", "caption":"", "alt":"", "hashtags":{"broad":[],"niche":[],"local":[]}, "slides":[{"setting":"", "description":"English: action and props in the place", '
          '"characters":[{"role":"","expression":"","position":""}], "props":[], "dialogue":[{"speaker":"role","text":""}], "narration":"", "unsupported_claim":""}]}')
 
 
@@ -326,23 +338,27 @@ def script_prompt(brief, product, brand_name, language, n, tone, cta):
         "- The description field is one plain English sentence describing the picture only (people, what they do, the place). No dialogue, no quotes, no text on signs.\n"
         "- You may ONLY state product claims that appear in PRODUCT FACTS. If the story asks for a claim that is not there (a number, price, guarantee, feature), "
         "write the slide without it and put a short note of the missing claim in that slide's unsupported_claim. Never invent numbers, prices or results.\n"
-        "- Choose every visual ONLY from this list of drawn parts:\n%s\n"
+        "- Each slide has a \"setting\": the place, in English. Pick a key from the list below when one fits, or write a short English place. Match what the slide is about "
+        "(reception, sample collection, lab bench, report handover ...), vary it across slides, but keep the SAME place for consecutive slides when the story stays in one place. "
+        "Never Hindi in setting or description.\nSETTINGS:\n%s\n"
+        "- Choose the other visuals ONLY from this list of drawn parts:\n%s\n"
         "- Max 2 characters per slide; props max 4. The LAST slide is a call-to-action slide: the shopkeeper (happy) invites the viewer, no new story; the call to action is exactly: %s\n"
         "- Brand: %s. Also write caption (2-4 short sentences), alt (one plain sentence describing the carousel), and hashtags "
         "(object with arrays broad, niche, local; 12-15 in total; local tags relate to Buxar and Bihar; no spam tags).\n"
         "Return ONLY JSON in this shape:\n%s"
-    ) % (brief.strip(), facts, n, LANGS.get(language, LANGS["Hindi"]), tone or "Friendly", parts_text(), cta or "(none)", brand_name, SHAPE)
+    ) % (brief.strip(), facts, n, LANGS.get(language, LANGS["Hindi"]), tone or "Friendly", places.prompt_hint(product["name"] if product else ""), parts_text(), cta or "(none)", brand_name, SHAPE)
 
 
 def slide_prompt(script, index, brief, product, language, tone, instruction=""):
     facts = product_facts(product) or "(no product selected: make NO product claims)"
-    keep = {"slides": [{k: s[k] for k in ("scene", "characters", "props", "dialogue", "narration")} for s in script["slides"]]}
+    keep = {"slides": [{k: s[k] for k in ("setting", "characters", "props", "dialogue", "narration")} for s in script["slides"]]}
     return (
         "Rewrite ONLY slide number %d of this cartoon story script (slides are numbered from 1), keeping the story flow. Same language (%s), tone %s.\n"
         "Story idea: %s\nExtra instruction: %s\nPRODUCT FACTS (only product claims allowed):\n%s\nIf a claim is missing from the facts, leave it out and note it in unsupported_claim.\n"
-        "Choose visuals only from:\n%s\nCurrent script:\n%s\nReturn ONLY JSON for that one slide: "
-        '{"scene":"","description":"","characters":[{"role":"","expression":"","position":""}],"props":[],"dialogue":[{"speaker":"role","text":""}],"narration":"","unsupported_claim":""}'
-    ) % (index + 1, LANGS.get(language, language), tone or "Friendly", brief.strip() or "(see script)", instruction or "make it better and different", facts, parts_text(),
+        "Setting and description are English only (never Hindi); keep the same place as the neighbouring slides unless this slide is about another place. Settings:\n%s\n"
+        "Choose other visuals only from:\n%s\nCurrent script:\n%s\nReturn ONLY JSON for that one slide: "
+        '{"setting":"","description":"English, picture only","characters":[{"role":"","expression":"","position":""}],"props":[],"dialogue":[{"speaker":"role","text":""}],"narration":"","unsupported_claim":""}'
+    ) % (index + 1, LANGS.get(language, language), tone or "Friendly", brief.strip() or "(see script)", instruction or "make it better and different", facts, places.prompt_hint(product["name"] if product else ""), parts_text(),
          json.dumps(keep, ensure_ascii=False))
 
 

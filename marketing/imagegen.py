@@ -13,11 +13,32 @@ TIMEOUT = 90
 RETRIES = 3
 SLEEP = time.sleep                                        # tests replace this
 
-STYLE = "premium editorial caricature illustration, expressive faces, slightly exaggerated features, warm lighting, small Indian kirana shop, clean composition"
+STYLE = "premium editorial caricature illustration, expressive faces, slightly exaggerated features, warm lighting, clean composition"      # the place comes from the slide setting
 NO_TEXT = ("No text anywhere: blank signboards, no signs, no readable text, no letters, no numbers, no logos, no watermarks, no captions, no speech bubbles; "
            "any paper or screen stays blank.")
-FRAMING = ("Medium shot, whole upper body visible. Characters fill at most 70 percent of the frame height, centered, with a clear empty margin on every side. "
-           "Plain uncluttered background.")
+FRAMING = ("Wide shot, full environment visible, characters smaller in frame. Characters occupy at most 50 percent of the frame height, placed left and right of centre, "
+           "with the setting clearly visible and filling the rest of the frame. Signboards and papers stay blank, no readable text.")
+NO_DUPES = "No extra people, no duplicate faces, no crowd, no reflections of people. Each named character appears exactly once."
+
+
+def count_line(names):
+    n = len(names)
+    return "Exactly %d %s%s. " % (n, "person" if n == 1 else "people", (": " + ", ".join(names)) if names else "")
+
+
+def name_labels(text, names):
+    """'the second shopkeeper' -> that character's name, so one named person is never described twice under two labels."""
+    t = str(text or "")
+    for phrase, role in (("the second shopkeeper", "shopkeeper2"), ("the first shopkeeper", "shopkeeper"), ("the customer", "customer")):
+        if names.get(role):
+            t = re.sub(phrase, names[role], t, flags=re.I)
+    return t
+
+
+def setting_of(slide, scene_names):
+    """English place for the picture: the slide's setting text, else the drawn-scene name."""
+    from . import places
+    return slide.get("setting") or places.text_of(slide.get("setting_key")) or scene_names.get(slide.get("scene"), "shop")
 SAFETY = ("Original fictional characters only, not resembling any real person, celebrity, brand mascot or known cartoon character. " + NO_TEXT + " " + FRAMING)
 BG_STYLE = "premium editorial illustration, warm soft lighting, clean uncluttered composition, shallow depth, slightly blurred background"
 BG_PLACES = {"shop": "an empty small Indian kirana shop interior with a wooden counter and shelves",
@@ -39,7 +60,7 @@ DEFAULT_CAST = [
      "red bindi, cloth shopping bag", 3303),
 ]
 LABELS = {"shopkeeper": "the first shopkeeper", "shopkeeper2": "the second shopkeeper", "customer": "the customer"}
-ROLE_RE = re.compile(r"\b(shop\s*keeper\s*[_ -]?\s*2|shop\s*keeper\s*[_ -]?\s*two|shop\s*keeper|customer)\b", re.I)
+ROLE_RE = re.compile(r"\b(?:the\s+)?(shop\s*keeper\s*[_ -]?\s*2|shop\s*keeper\s*[_ -]?\s*two|shop\s*keeper|customer)\b", re.I)
 
 
 class ImageError(Exception):
@@ -273,7 +294,7 @@ def scrub(text, names=None):
     t = re.sub(r"(?m)^\s*(shop\s*keeper\s*[_ -]?\s*(2|two)?|customer)\s*[:\-]\s*", "", str(text or ""), flags=re.I)
 
     def sub(m):
-        k = re.sub(r"[\s_-]+", "", m.group(0).lower())
+        k = re.sub(r"[\s_-]+", "", m.group(1).lower())
         role = "shopkeeper2" if k in ("shopkeeper2", "shopkeepertwo") else ("customer" if k == "customer" else "shopkeeper")
         return names.get(role) or LABELS[role]
     return ROLE_RE.sub(sub, t).strip()
@@ -291,13 +312,14 @@ def scene_prompt(slide, cast, scene_names):
             continue
         people.append("%s: %s, expression %s" % (c["name"], c["description"], ch.get("expression") or "neutral"))
         left_right.append("%s on the %s" % (c["name"], ch.get("position") or "center"))
-    desc = re.sub(r"[\"\u201c\u201d'][^\"\u201c\u201d']{0,200}[\"\u201c\u201d']", "", scrub(slide.get("description"), names))
+    desc = QUOTED.sub("", scrub(name_labels(slide.get("description"), names), names))
     props = ", ".join(p for p in slide.get("props", []))
-    scene = scene_names.get(slide.get("scene"), "shop")
+    scene = setting_of(slide, scene_names)
     seed = by.get((slide.get("characters") or [{}])[0].get("role"), {}).get("seed") or 1
-    prompt = "%s. Setting: %s. Characters: %s. Positions: %s. Scene: %s.%s %s" % (
-        STYLE, scene, " | ".join(people) or "none", ", ".join(left_right) or "centered", desc or "the characters talk",
-        (" Objects shown: %s." % props) if props else "", SAFETY)
+    cnt = count_line([p.split(":")[0] for p in people])
+    prompt = "%s. %sWide shot, full environment visible, characters smaller in frame, detailed %s background. Characters: %s. Positions: %s. Action: %s.%s %s %s" % (
+        STYLE, cnt, scene, " | ".join(people) or "none", ", ".join(left_right) or "centered", desc or "the characters talk",
+        (" Objects shown: %s." % props) if props else "", NO_DUPES, SAFETY)
     return prompt, int(seed)
 
 
@@ -419,13 +441,14 @@ def ref_scene_prompt(slide, cast, scene_names):
     by = {c["role"]: c for c in cast}
     chars = [by[ch["role"]] for ch in slide.get("characters", [])[:2] if by.get(ch.get("role")) and by[ch["role"]].get("master")]
     names = {r: by[r]["name"] for r in by if by[r]["name"]}
-    desc = QUOTED.sub("", scrub(slide.get("description"), names))
+    desc = QUOTED.sub("", scrub(name_labels(slide.get("description"), names), names))
     two = len(chars) == 2
     head = ("The first person is the same as in reference image 1, the second person is the same as in reference image 2: same faces, hair, clothes. " if two else SAME)
     pos = ("Positions: " + ", ".join("person %d on the %s" % (k + 1, ch.get("position") or "center") for k, ch in enumerate(slide["characters"][:2])) + ". ") if two else ""
-    prompt = "%s%s. Setting: %s. %sScene: %s. Expressions: %s. %s" % (
-        head, STYLE, scene_names.get(slide.get("scene"), "shop"), pos, desc or "the characters talk",
-        ", ".join(ch.get("expression") or "neutral" for ch in slide.get("characters", [])[:2]), SAFETY)
+    cnt = count_line(["person %d (%s)" % (k + 1, (by.get(ch.get("role")) or {}).get("name") or "character") for k, ch in enumerate(slide.get("characters", [])[:2])])
+    prompt = "%s%s%s. Wide shot, full environment visible, characters smaller in frame, detailed %s background. %sAction: %s. Expressions: %s. %s %s" % (
+        head, cnt, STYLE, setting_of(slide, scene_names), pos, desc or "the characters talk",
+        ", ".join(ch.get("expression") or "neutral" for ch in slide.get("characters", [])[:2]), NO_DUPES, SAFETY)
     return prompt, [c["master"] for c in chars]
 
 

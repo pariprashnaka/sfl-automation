@@ -1198,7 +1198,7 @@ class CharacterLibrary(unittest.TestCase):
         self.assertTrue(one.startswith("Same person as in the reference image, same face, hair, clothes."))
         self.assertEqual(len(m1), 1)
         for text in (prompt, one):
-            for w in ("blank signboards", "no readable text", "no letters", "no logos", "70 percent", "Medium shot"):
+            for w in ("blank signboards", "no readable text", "no letters", "no logos", "50 percent", "Wide shot"):
                 self.assertIn(w, text)
             self.assertNotIn("Shopkeeper2", text)
         r = self.ig.generate_refs(prompt, masters, self.m.env_val, self.conn(), self.settings())
@@ -1377,6 +1377,87 @@ class CharacterLibrary(unittest.TestCase):
         c = self.m.conn()
         self.assertEqual(c.execute("SELECT char_id FROM cast_members WHERE brand_id=? AND role='customer'", (bid,)).fetchone()[0], 1)
         c.close()
+
+
+class Settings(unittest.TestCase):
+    """Background setting chosen per slide from product and story; English only; wide shot; exact people count."""
+
+    def cast(self):
+        from marketing import imagegen
+        return [dict(role=r, name=n, description=d, seed=s, master="x.png") for r, n, d, s in imagegen.DEFAULT_CAST]
+
+    def test_presets_by_product_and_english_only(self):
+        from marketing import places
+        self.assertEqual(places.defaults("LIMS")[0], "lab_reception")
+        self.assertIn("lab_bench", places.defaults("LIMS"))
+        self.assertIn("doctor_room", places.defaults("HMS"))
+        self.assertIn("godown", places.defaults("InventoryCloud"))
+        self.assertEqual(places.family("something else"), "")
+        for k in ("lab_reception", "sample_collection", "lab_bench", "report_handover", "clinic_reception", "hospital_reception", "doctor_room", "waiting_area",
+                  "retail_shop", "godown", "billing_counter", "office", "street", "phone_closeup"):
+            self.assertIn(k, places.PRESETS)
+        self.assertIn("sample tubes", places.text_of("lab"))
+        self.assertIn("microscope", places.text_of("lab"))
+        self.assertEqual(places.menu("LIMS")[0][0], "lab_reception")                           # the product's own settings first
+        self.assertEqual(places.english_only("लैब बेंच पर बातचीत"), "")                       # Hindi is never kept
+        self.assertEqual(places.english_only("lab bench लैब and tubes"), "lab bench and tubes")
+
+    def test_clean_slide_setting_key_text_and_hindi_dropped(self):
+        s = cartoon.clean_slide({"setting": "lab_bench", "description": "रिपोर्ट देते हुए"})
+        self.assertEqual((s["setting_key"], s["description"]), ("lab_bench", ""))
+        self.assertIn("microscope", s["setting"])
+        c = cartoon.clean_slide({"setting": "a sunny pathology lab corridor", "description": "two people talk"})
+        self.assertEqual((c["setting_key"], c["setting"]), ("custom", "a sunny pathology lab corridor"))
+        h = cartoon.clean_slide({"setting": "पैथोलॉजी लैब"})
+        self.assertEqual((h["setting"], h["setting_key"]), ("", ""))
+
+    def test_script_picks_product_settings_and_varies(self):
+        d = {"slides": [{"dialogue": [{"speaker": "shopkeeper", "text": "ठीक है"}]}] * 4}
+        s = cartoon.clean_script(d, 4, "", "Hindi", "", product_name="LIMS")
+        keys = [x["setting_key"] for x in s["slides"]]
+        self.assertEqual(keys[:4], ["lab_reception", "sample_collection", "lab_bench", "report_handover"])
+        self.assertTrue(all(x["setting"] for x in s["slides"]))
+        h = cartoon.clean_script(d, 4, "", "Hindi", "", product_name="HMS")
+        self.assertEqual(h["slides"][0]["setting_key"], "hospital_reception")
+        i = cartoon.clean_script(d, 4, "", "Hindi", "", product_name="InventoryCloud")
+        self.assertEqual(i["slides"][0]["setting_key"], "retail_shop")
+        keep = {"slides": [{"setting": "lab_bench", "dialogue": [{"speaker": "shopkeeper", "text": "ठीक"}]}, {"dialogue": [{"speaker": "shopkeeper", "text": "ठीक"}]}]}
+        k = cartoon.clean_script(keep, 2, "", "Hindi", "", product_name="LIMS")
+        self.assertEqual(k["slides"][0]["setting_key"], "lab_bench")                           # the AI's own choice is kept
+        cta = cartoon.clean_script(keep, 2, "", "Hindi", "Call us", product_name="LIMS")
+        self.assertEqual(cta["slides"][-1]["setting"], cta["slides"][-2]["setting"])           # CTA slide stays in the same place
+
+    def test_prompts_ask_for_english_setting_variation_and_consistency(self):
+        pr = cartoon.script_prompt("brief", {"name": "LIMS", "description": "d", "key_points": "k", "price_note": ""}, "SFL", "Hindi", 4, "t", "Call")
+        for w in ("lab_bench", "microscope", "Never Hindi in setting or description", "vary it across slides", "SAME place", "reception, sample collection, lab bench, report handover"):
+            self.assertIn(w, pr)
+        self.assertIn('"setting"', cartoon.SHAPE)
+        sp = cartoon.slide_prompt({"slides": [cartoon.clean_slide({"setting": "lab"})]}, 0, "b", None, "Hindi", "t")
+        self.assertIn("English only", sp)
+
+    def test_picture_prompts_wide_shot_exact_count_no_duplicates(self):
+        from marketing import imagegen
+        two = cartoon.clean_slide({"setting": "lab_bench", "description": "Shopkeeper2 hands a report to the customer",
+                                   "characters": [{"role": "shopkeeper2", "position": "left"}, {"role": "customer", "position": "right"}]})
+        one = cartoon.clean_slide({"setting": "doctor_room", "characters": [{"role": "customer", "position": "center"}]})
+        p2, _ = imagegen.scene_prompt(two, self.cast(), cartoon.SCENES)
+        r2, masters = imagegen.ref_scene_prompt(two, self.cast(), cartoon.SCENES)
+        p1, _ = imagegen.scene_prompt(one, self.cast(), cartoon.SCENES)
+        for text in (p2, r2):
+            self.assertIn("wide shot, full environment visible, characters smaller in frame, detailed", text.lower())
+            for w in ("Exactly 2 people", "microscope", "50 percent", "no duplicate faces",
+                      "No extra people", "appears exactly once", "blank signboards", "no readable text"):
+                self.assertIn(w, text)
+            self.assertNotIn("kirana", text)                                                  # the place comes from the setting, not a fixed shop
+            self.assertNotIn("Shopkeeper2", text)
+        self.assertEqual(p2.count("Sunil:"), 1)                                               # each named character is described once
+        self.assertEqual(p2.count("Meena:"), 1)
+        self.assertTrue(r2.startswith("The first person is the same as in reference image 1"))
+        self.assertEqual(len(masters), 2)
+        self.assertIn("Exactly 1 person", p1)
+        self.assertIn("doctor's consultation room", p1)
+        self.assertIn("Sunil hands a report to Meena", p2)
+        self.assertNotIn("the second shopkeeper", p2)                                         # labels become the character name once
 
 
 if __name__ == "__main__":
