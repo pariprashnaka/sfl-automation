@@ -1,7 +1,10 @@
 """Create page: pick brand/product/platform/type, generate an image preview (and, from stage 3, caption + hashtags)."""
 import json, pathlib, re, shutil, time, uuid
 from flask import request, jsonify
-from . import db as mdb, images
+import sys
+sys.path.insert(0, r"D:\vault\automation")
+from ai_router import ai, AIError
+from . import db as mdb, images, hashtags
 from . import routes
 from .routes import bp, page, db, esc, flash
 
@@ -69,9 +72,54 @@ def cleanup_previews():
         pass
 
 
+def build_prompt(b, p, topic, tone, variant):
+    facts = []
+    if p:
+        facts += ["Product: " + p["name"], "What it is: " + (p["description"] or ""), "Key points: " + "; ".join(images.split_lines(p["key_points"])),
+                  "Price note: " + (p["price_note"] or "none")]
+    return (
+        "You write short social media copy for a small Indian software company. Use ONLY the facts below. Do not invent numbers, prices, "
+        "customer names, awards, guarantees or results, and do not mention dashboards, apps or features that are not in the facts. "
+        "If a detail is not in the facts, leave it out. The image is a text graphic card (headline and key points), never a screenshot; describe it that way.\n"
+        "Brand: %s\n%s\nTopic: %s\nTone: %s\nVariant id: %s\n\n"
+        "Return ONLY JSON with these keys: headline (max 7 words), sub (max 18 words), points (3 short phrases from the facts), "
+        "caption (2-4 short sentences, ends with a simple call to action), alt (one plain sentence describing the image for screen readers), "
+        "hashtags (object with arrays broad, niche, local; 12-15 tags in total; local tags relate to Buxar and Bihar; no spam tags)."
+    ) % (b["name"], "\n".join(facts), topic, tone or "Friendly", variant or "0")
+
+
+def parse_json(text):
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        raise ValueError("no JSON")
+    return json.loads(m.group(0))
+
+
+def unsupported_numbers(text, source):
+    """Numbers in the generated text that do not appear in the facts or topic the owner supplied."""
+    src = set(re.findall(r"\d[\d,.]*", source or ""))
+    return sorted({n.strip(".,") for n in re.findall(r"\d[\d,.]*", text or "")} - {s.strip(".,") for s in src})
+
+
 def make_content(b, p, topic, tone, variant):
-    """Hook for caption/hashtag generation (added in stage 3). Returns dict with caption, hashtags, alt, headline, sub, points, notes."""
-    return {}
+    """Caption, tiered hashtags and alt text from the router (task marketing_caption, small model, cached).
+    Public product facts only. Returns {} plus a note if the AI is unavailable, so the image still renders."""
+    try:
+        raw = ai("marketing_caption", build_prompt(b, p, topic, tone, variant))
+        d = parse_json(raw)
+    except AIError as ex:
+        return {"notes": "Caption was not generated: " + str(ex)[:140]}
+    except Exception:
+        return {"notes": "Caption was not generated: the AI answer could not be read. Press Regenerate."}
+    tags = hashtags.build(d.get("hashtags") or [], banned=())
+    src = " ".join([topic, b["name"]] + ([p["name"], p["description"] or "", p["key_points"] or "", p["price_note"] or ""] if p else []))
+    bad = unsupported_numbers(" ".join(str(d.get(k, "")) for k in ("caption", "headline", "sub", "alt")) + " " + " ".join(map(str, d.get("points") or [])), src)
+    notes = "Hashtags are suggested; popularity is not verified."
+    if bad:
+        notes += " Check these numbers, they are not in your facts: " + ", ".join(bad) + "."
+    pts = [str(x) for x in (d.get("points") or []) if str(x).strip()][:4]
+    return {"caption": str(d.get("caption", "")).strip(), "hashtags": hashtags.as_text(tags), "alt": str(d.get("alt", "")).strip(), "notes": notes,
+            "headline": str(d.get("headline", "")).strip(), "sub": str(d.get("sub", "")).strip(), "points": pts or None, "tiers": hashtags.tier_map(tags)}
 
 
 @bp.route("/api/marketing/generate", methods=["POST"])

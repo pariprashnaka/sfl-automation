@@ -146,5 +146,72 @@ class Stage2(unittest.TestCase):
         self.assertEqual(len(json.loads(row["image_paths"])), 1)
 
 
+from marketing import hashtags, create
+import ai_router
+
+
+class Stage3(unittest.TestCase):
+    def test_hashtag_tiers_count_and_spam(self):
+        ai_tags = {"broad": ["#Business", "#follow4follow", "#SmallBusiness"], "niche": ["#Inventory Software", "#StockControl", "#stockcontrol"],
+                   "local": ["#Buxar", "#BiharStartups"]}
+        r = hashtags.build(ai_tags)
+        tags = [t["tag"].lower() for t in r]
+        self.assertNotIn("#follow4follow", tags)
+        self.assertEqual(len(tags), len(set(tags)))                     # deduped
+        self.assertTrue(12 <= len(r) <= 15, len(r))
+        tiers = {t["tag"]: t["tier"] for t in r}
+        self.assertEqual(tiers["#Buxar"], "local")
+        self.assertEqual(tiers["#BiharStartups"], "local")
+        self.assertEqual(tiers["#SmallBusiness"], "broad")
+        self.assertEqual(tiers["#InventorySoftware"], "niche")
+        self.assertTrue(all(t["tier"] in hashtags.TIERS for t in r))
+
+    def test_local_always_present_and_cap(self):
+        r = hashtags.build(["#a1b2c3d%d" % i for i in range(40)])
+        self.assertLessEqual(len(r), 15)
+        self.assertGreaterEqual(sum(1 for t in r if t["tier"] == "local"), 2)
+        self.assertEqual(len(hashtags.build("")) >= 12, True)
+
+    def test_banned_tags_removed(self):
+        r = hashtags.build({"niche": ["#BadTag", "#GoodTag"]}, banned=["#badtag"])
+        self.assertNotIn("#badtag", [t["tag"].lower() for t in r])
+
+    def test_router_config(self):
+        self.assertEqual(ai_router.CONFIG["task_size"]["marketing_caption"], "small")
+        self.assertIn("marketing_caption", ai_router.CONFIG["cache_tasks"])
+
+    def test_make_content_with_mock_ai(self):
+        b = {"name": "SFL"}
+        p = {"name": "InventoryCloud", "description": "Inventory software.", "key_points": "Stock in one place", "price_note": ""}
+        seen = {}
+
+        def fake(task, prompt, **k):
+            seen["task"], seen["prompt"] = task, prompt
+            return 'Sure: {"headline":"Know your stock","sub":"One place.","points":["Stock in one place"],"caption":"Track stock. 99 offers!","alt":"A card","hashtags":{"broad":["#Business"],"niche":["#Stock"],"local":["#Buxar"]}}'
+        old = create.ai
+        create.ai = fake
+        try:
+            c = create.make_content(b, p, "stock", "Friendly", "1")
+        finally:
+            create.ai = old
+        self.assertEqual(seen["task"], "marketing_caption")
+        self.assertIn("ONLY the facts", seen["prompt"])
+        self.assertNotIn("owner_notes", seen["prompt"])
+        self.assertTrue(12 <= len(c["hashtags"].split()) <= 15)
+        self.assertIn("popularity is not verified", c["notes"])
+        self.assertIn("99", c["notes"])                                  # number not in facts is flagged
+
+    def test_make_content_failures_do_not_raise(self):
+        b = {"name": "SFL"}
+        old = create.ai
+        try:
+            create.ai = lambda *a, **k: (_ for _ in ()).throw(create.AIError("all down"))
+            self.assertIn("not generated", create.make_content(b, None, "t", "", "1")["notes"])
+            create.ai = lambda *a, **k: "not json at all"
+            self.assertIn("not generated", create.make_content(b, None, "t", "", "1")["notes"])
+        finally:
+            create.ai = old
+
+
 if __name__ == "__main__":
     unittest.main()
