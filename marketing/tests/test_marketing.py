@@ -1305,8 +1305,8 @@ class CharacterLibrary(unittest.TestCase):
         self.assertFalse(self.cl.post("/api/marketing/characters/1/pick", json={"name": "../../x.png"}).get_json()["ok"])
         self.assertTrue(self.cl.post("/api/marketing/characters/1/pick", json={"name": cands[1]["name"]}).get_json()["ok"])
         self.assertEqual(self.cl.get("/marketing/char/1").status_code, 200)
-        self.assertTrue((mdb.ASSETS / "characters" / "1.png").is_file())
-        self.assertLessEqual(max(Image.open(mdb.ASSETS / "characters" / "1.png").size), 1024)
+        self.assertTrue((mdb.ASSETS / "characters" / "1.jpg").is_file())
+        self.assertLessEqual(max(Image.open(mdb.ASSETS / "characters" / "1.jpg").size), 1536)
         c = self.m.conn()
         brand = c.execute("SELECT * FROM brands LIMIT 1").fetchone()
         c.close()
@@ -1329,7 +1329,7 @@ class CharacterLibrary(unittest.TestCase):
         self.assertTrue(up["ok"], up)
         self.assertFalse(self.cl.post("/api/marketing/characters/%d/master" % cid, data={"file": (io.BytesIO(b"nope"), "m.png")}, content_type="multipart/form-data").get_json()["ok"])
         self.assertIn("Lakshmi ji", self.cl.get("/marketing/characters").get_data(as_text=True))
-        f = mdb.ASSETS / "characters" / ("%d.png" % cid)
+        f = mdb.ASSETS / "characters" / ("%d.jpg" % cid)
         self.assertTrue(f.is_file())
         c = self.m.conn()
         c.execute("UPDATE cast_members SET char_id=? WHERE role='customer'", (cid,))
@@ -1340,6 +1340,25 @@ class CharacterLibrary(unittest.TestCase):
         c = self.m.conn()
         self.assertEqual(c.execute("SELECT COUNT(*) FROM cast_members WHERE char_id=?", (cid,)).fetchone()[0], 0)
         c.close()
+
+    def test_master_upload_accepts_uppercase_names_and_any_name_by_content(self):
+        def up(name, data):
+            return self.cl.post("/api/marketing/characters/1/master", data={"file": (io.BytesIO(data), name)}, content_type="multipart/form-data").get_json()
+        buf = io.BytesIO()
+        Image.new("RGB", (2400, 1800), (90, 60, 40)).save(buf, "JPEG")
+        jpg = buf.getvalue()
+        for name in ("VIK_0280.JPG", "a.JPEG", "b.jpeg", "photo.dat", "noext"):                # name does not matter, content does
+            r = up(name, jpg)
+            self.assertTrue(r["ok"], (name, r))
+            im = Image.open(mdb.ASSETS / "characters" / "1.jpg")
+            self.assertEqual(im.format, "JPEG")
+            self.assertEqual(max(im.size), 1536)                                                 # downscaled, converted to JPEG
+        for name, fmt in (("X.PNG", "PNG"), ("Y.WEBP", "WEBP")):
+            b = io.BytesIO()
+            Image.new("RGBA", (300, 200), (1, 2, 3, 255)).save(b, fmt)
+            self.assertTrue(up(name, b.getvalue())["ok"], name)
+        self.assertFalse(up("VIK.JPG", b"not an image")["ok"])
+        self.assertFalse((mdb.ASSETS / "characters" / "1.png").exists())
 
     def test_propose_characters_from_brief_mocked_ai(self):
         self.sr.ai = lambda task, prompt, **k: json.dumps({"characters": [{"name": "Gopal", "description": "young tea seller, thin, cap"}, {"name": "", "description": "x"},

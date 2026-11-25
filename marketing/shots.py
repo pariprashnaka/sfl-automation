@@ -11,7 +11,7 @@ MAX_BYTES = 15 * 1024 * 1024
 MAX_FILES = 10
 WARNING = "Use demo data only. Make sure no real customer names, phone numbers or amounts are visible."
 CONFIRM = "I confirm no real customer data"
-FORMATS = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".png"}      # webp is stored as lossless png
+FORMATS = {"PNG": ".png", "JPEG": ".jpg", "MPO": ".jpg", "WEBP": ".png"}      # MPO = JPEG from many cameras/phones      # webp is stored as lossless png
 
 
 class ShotError(ValueError):
@@ -29,9 +29,10 @@ def clean_meta(title, note):
     return one_line(title, 80), note
 
 
-def check_image(data, filename):
+def check_image(data, filename, by_content=False):
+    """by_content=True ignores the file name and trusts only what Pillow can open (JPEG/MPO, PNG, WEBP)."""
     ext = pathlib.Path(filename or "").suffix.lower()
-    if ext not in mdb.IMG_EXT:
+    if not by_content and ext not in mdb.IMG_EXT:
         raise ShotError("%s: only PNG, JPG or WEBP files are accepted." % (filename or "file"))
     if not data or len(data) > MAX_BYTES:
         raise ShotError("%s: file is empty or larger than 15 MB." % filename)
@@ -48,7 +49,7 @@ def check_image(data, filename):
 
 def downscale(im):
     """Max 2400 px wide (never upscaled). EXIF rotation applied. Returns (image, format)."""
-    fmt = im.format
+    fmt = "JPEG" if im.format == "MPO" else im.format
     im = ImageOps.exif_transpose(im)
     if im.width > MAX_W:
         im = im.resize((MAX_W, max(1, round(im.height * MAX_W / im.width))), Image.LANCZOS)

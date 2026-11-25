@@ -10,7 +10,7 @@ from . import story_routes as sr
 from .story_routes import start_job
 from .create import parse_json
 
-MASTER_PX = 1024
+MASTER_PX = 1536
 
 
 def master_dir():
@@ -31,14 +31,17 @@ def clean_desc(s):
 
 
 def set_master(c, cid, im):
-    """Store an image as the locked master (max 1024 px, PNG)."""
+    """Store an image as the locked master (JPEG, max 1536 px on the long side)."""
     if max(im.size) > MASTER_PX:
         im = im.copy()
         im.thumbnail((MASTER_PX, MASTER_PX), Image.LANCZOS)
     master_dir().mkdir(parents=True, exist_ok=True)
-    f = master_dir() / ("%d.png" % cid)
-    im.convert("RGB").save(f, "PNG", optimize=True)
-    c.execute("UPDATE characters SET master=? WHERE id=?", ("characters/%d.png" % cid, cid))
+    f = master_dir() / ("%d.jpg" % cid)
+    old = master_dir() / ("%d.png" % cid)
+    im.convert("RGB").save(f, "JPEG", quality=92, optimize=True)
+    if old.is_file():
+        old.unlink()
+    c.execute("UPDATE characters SET master=? WHERE id=?", ("characters/%d.jpg" % cid, cid))
     c.commit()
     return f
 
@@ -127,7 +130,7 @@ def api_char_upload(cid):
         if not c.execute("SELECT 1 FROM characters WHERE id=?", (cid,)).fetchone():
             return jsonify(ok=False, error="Character not found.")
         try:
-            im = shots.check_image(f.read(shots.MAX_BYTES + 1), f.filename)
+            im = shots.check_image(f.read(shots.MAX_BYTES + 1), f.filename, by_content=True)
             im, _ = shots.downscale(im)
         except shots.ShotError as ex:
             return jsonify(ok=False, error=str(ex))
