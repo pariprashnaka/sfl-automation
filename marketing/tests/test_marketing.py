@@ -1,4 +1,4 @@
-import json, os, sys, io, sqlite3, tempfile, types, unittest, pathlib, shutil
+import datetime, json, os, sys, io, sqlite3, tempfile, types, unittest, pathlib, shutil
 sys.path.insert(0, r"D:\vault\automation")
 from flask import Flask
 from marketing import db as mdb
@@ -83,12 +83,15 @@ class Stage2(unittest.TestCase):
         self.old = (mdb.ASSETS, mdb.OUT_ROOT)
         mdb.ASSETS = pathlib.Path(self.tmp) / "assets"
         mdb.OUT_ROOT = pathlib.Path(self.tmp) / "out"
+        self._ram = images.free_ram_mb
+        images.free_ram_mb = lambda: 4000            # tests must not depend on how much RAM this laptop has free right now
         self.m = make_app(self.tmp)
         c = self.m.conn()
         self.b = c.execute("SELECT * FROM brands WHERE name='SFL'").fetchone()
         self.p = c.execute("SELECT * FROM products WHERE name='InventoryCloud'").fetchone()
 
     def tearDown(self):
+        images.free_ram_mb = self._ram
         mdb.ASSETS, mdb.OUT_ROOT = self.old
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -309,6 +312,242 @@ class Stage4(unittest.TestCase):
             self.assertEqual(calls, [pid])
         finally:
             mq.publish_post = old
+
+
+import hashlib
+from marketing import ig_publish as ig
+
+
+class Resp:
+    def __init__(self, status=200, j=None):
+        self.status_code, self._j = status, j if j is not None else {}
+
+    def json(self):
+        return self._j
+
+
+class FakeHttp:
+    """Scripted Cloudinary + Graph API. Records (method, url, params) and never touches the network."""
+    def __init__(self, statuses=("FINISHED",), fail=None, quota=0):
+        self.calls, self.statuses, self.fail, self.quota, self.n = [], list(statuses), fail, quota, 0
+
+    def _rec(self, m, url, params):
+        self.calls.append((m, url, dict(params or {})))
+
+    def names(self):
+        return [c[1].split("/")[-1] if "graph" not in c[1] else "/".join(c[1].split("/")[4:]) for c in self.calls]
+
+    def post(self, url, data=None, files=None, timeout=None):
+        self._rec("POST", url, data)
+        if "cloudinary" in url:
+            if url.endswith("/upload"):
+                self.n += 1
+                return Resp(200, {"secure_url": "https://res.cloudinary.com/c/image/upload/v1/mkt_%d.jpg" % self.n, "public_id": "mkt_%d" % self.n})
+            return Resp(200, {"result": "ok"})
+        if self.fail == "media" and url.endswith("/media"):
+            return Resp(400, {"error": {"message": "Media upload has failed", "code": 9004}})
+        if url.endswith("/media_publish"):
+            return Resp(200, {"id": "MEDIA1"})
+        if url.endswith("/media"):
+            self.n += 1
+            return Resp(200, {"id": "CONT%d" % self.n})
+        return Resp(404, {})
+
+    def get(self, url, params=None, timeout=None):
+        self._rec("GET", url, params)
+        if url.endswith("content_publishing_limit"):
+            return Resp(200, {"data": [{"quota_usage": self.quota}]})
+        if self.fail == "auth":
+            return Resp(400, {"error": {"message": "Invalid OAuth access token.", "code": 190}})
+        if params and params.get("fields") == "status_code":
+            return Resp(200, {"status_code": self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]})
+        if params and params.get("fields") == "permalink":
+            return Resp(200, {"permalink": "https://instagram.com/p/XYZ/"})
+        return Resp(200, {"username": "demo_user"})
+
+
+ENV = {"IG_USER_ID": "123", "IG_ACCESS_TOKEN": "TOKEN_SECRET", "CLOUDINARY_CLOUD_NAME": "c", "CLOUDINARY_API_KEY": "k", "CLOUDINARY_API_SECRET": "s3cret"}
+
+
+class Stage5(unittest.TestCase):
+    def setUp(self):
+        self.cfg = ig.Config(ENV.get)
+        self.tmp = tempfile.mkdtemp()
+        self.img = os.path.join(self.tmp, "a.jpg")
+        Image.new("RGB", (50, 50), "black").save(self.img)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_signature(self):
+        sig = ig.sign({"timestamp": 1315060510, "public_id": "sample"}, "abcd")
+        self.assertEqual(sig, hashlib.sha1(b"public_id=sample&timestamp=1315060510abcd").hexdigest())
+
+    def test_host_and_test_connection(self):
+        self.assertEqual(ig.IG_HOST, "https://graph.facebook.com/v21.0")
+        h = FakeHttp()
+        r = ig.test_connection(self.cfg, h)
+        self.assertEqual(r, {"ok": True, "username": "demo_user"})
+        m, url, params = h.calls[0]
+        self.assertTrue(url.startswith("https://graph.facebook.com/v21.0/123"))
+        self.assertEqual(params["fields"], "username")                   # never account_type
+        self.assertNotIn("graph.instagram.com", url)
+
+    def test_connection_errors_are_plain_and_hide_secrets(self):
+        r = ig.test_connection(self.cfg, FakeHttp(fail="auth"))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["kind"], "auth")
+        self.assertNotIn("TOKEN_SECRET", r["error"])
+        r = ig.test_connection(ig.Config({}.get), FakeHttp())
+        self.assertIn("Missing settings", r["error"])
+
+    def test_error_mapping(self):
+        self.assertEqual(ig.map_error(400, {"error": {"code": 10, "message": "x"}}).kind, "permission")
+        self.assertIn("app review", str(ig.map_error(400, {"error": {"code": 10, "message": "x"}})))
+        self.assertEqual(ig.map_error(400, {"error": {"code": 4, "message": "x"}}).kind, "limit")
+        self.assertEqual(ig.map_error(400, {"error": {"code": 190, "message": "x"}}).kind, "auth")
+        self.assertEqual(ig.map_error(400, {"error": {"code": 9004, "message": "bad image"}}).kind, "container")
+
+    def test_single_post_flow_and_cleanup(self):
+        h = FakeHttp(statuses=["IN_PROGRESS", "FINISHED"])
+        waits = []
+        res = ig.publish_images(self.cfg, [self.img], "post", "cap", "alt", dry_run=False, http=h, sleep=waits.append)
+        self.assertEqual((res["media_id"], res["permalink"]), ("MEDIA1", "https://instagram.com/p/XYZ/"))
+        self.assertEqual(waits, [60])                                    # polled once a minute
+        posts = [c for c in h.calls if c[0] == "POST"]
+        up = posts[0]
+        self.assertTrue(up[1].endswith("/image/upload"))
+        self.assertEqual(up[2]["signature"], ig.sign({"public_id": up[2]["public_id"], "timestamp": up[2]["timestamp"]}, "s3cret"))
+        media = [c for c in posts if c[1].endswith("/media")][0]
+        self.assertIn("/upload/f_jpg/", media[2]["image_url"])
+        self.assertEqual((media[2]["caption"], media[2]["alt_text"]), ("cap", "alt"))
+        self.assertTrue(any(c[1].endswith("/image/destroy") for c in posts))   # hosted image removed
+
+    def test_dry_run_skips_media_publish_only(self):
+        h = FakeHttp()
+        res = ig.publish_images(self.cfg, [self.img], "post", "c", dry_run=True, http=h, sleep=lambda s: None)
+        self.assertTrue(res["dry_run"])
+        urls = [c[1] for c in h.calls]
+        self.assertFalse(any(u.endswith("/media_publish") for u in urls))
+        self.assertTrue(any(u.endswith("/image/upload") for u in urls))
+        self.assertTrue(any(u.endswith("/media") for u in urls))
+        self.assertTrue(any(u.endswith("/image/destroy") for u in urls))
+
+    def test_story_and_carousel(self):
+        h = FakeHttp()
+        ig.publish_images(self.cfg, [self.img], "story", dry_run=True, http=h, sleep=lambda s: None)
+        self.assertEqual([c[2]["media_type"] for c in h.calls if c[1].endswith("/media")], ["STORIES"])
+        h = FakeHttp()
+        ig.publish_images(self.cfg, [self.img, self.img, self.img], "carousel", "cap", dry_run=True, http=h, sleep=lambda s: None)
+        media = [c[2] for c in h.calls if c[1].endswith("/media")]
+        self.assertEqual([m.get("is_carousel_item") for m in media[:3]], ["true"] * 3)
+        self.assertEqual(media[3]["media_type"], "CAROUSEL")
+        self.assertEqual(len(media[3]["children"].split(",")), 3)
+        with self.assertRaises(ig.IGError):
+            ig.publish_images(self.cfg, [self.img], "carousel", http=FakeHttp())
+
+    def test_poll_error_timeout_and_cleanup_on_failure(self):
+        with self.assertRaises(ig.IGError) as cm:
+            ig.wait_ready(self.cfg, "C1", FakeHttp(statuses=["ERROR"]), lambda s: None)
+        self.assertEqual(cm.exception.kind, "container")
+        waits = []
+        with self.assertRaises(ig.IGError):
+            ig.wait_ready(self.cfg, "C1", FakeHttp(statuses=["IN_PROGRESS"]), waits.append)
+        self.assertEqual(len(waits), 4)                                  # 5 checks, 4 one-minute waits
+        h = FakeHttp(fail="media")
+        with self.assertRaises(ig.IGError):
+            ig.publish_images(self.cfg, [self.img], "post", http=h, sleep=lambda s: None)
+        self.assertTrue(any(c[1].endswith("/image/destroy") for c in h.calls))   # cleaned up even on failure
+
+
+class Stage5Service(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (mdb.ASSETS, mdb.OUT_ROOT)
+        mdb.ASSETS = pathlib.Path(self.tmp) / "assets"
+        mdb.OUT_ROOT = pathlib.Path(self.tmp) / "out"
+        self.m = make_app(self.tmp)
+        self.m.env_val = ENV.get
+        self.c = self.m.conn()
+        self.img = os.path.join(self.tmp, "a.jpg")
+        Image.new("RGB", (50, 50), "black").save(self.img)
+
+    def tearDown(self):
+        mdb.ASSETS, mdb.OUT_ROOT = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def post(self, status="approved", approved=True, published_ago_hours=None):
+        cur = self.c.execute("INSERT INTO posts(brand_id,product_id,platforms,type,caption,hashtags,status,image_paths,created_at,approved_at,published_at) "
+                             "VALUES(1,1,'instagram','post','cap','#a',?,?,?,?,?)",
+                             (status, json.dumps([self.img]), mdb.now(), mdb.now() if approved else "",
+                              (datetime.datetime.now() - datetime.timedelta(hours=published_ago_hours)).strftime("%Y-%m-%d %H:%M:%S") if published_ago_hours is not None else ""))
+        self.c.commit()
+        return cur.lastrowid
+
+    def row(self, pid):
+        return self.c.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
+
+    def test_approval_gate_blocks_before_any_http(self):
+        h = FakeHttp()
+        ok, msg = ig.publish_post(self.m, self.post(status="draft", approved=False), h, lambda s: None)
+        self.assertFalse(ok)
+        self.assertEqual(h.calls, [])
+
+    def test_dry_run_default_keeps_post_approved(self):
+        h = FakeHttp()
+        pid = self.post()
+        ok, msg = ig.publish_post(self.m, pid, h, lambda s: None)
+        self.assertTrue(ok, msg)
+        self.assertIn("Nothing was published", msg)
+        self.assertEqual(self.row(pid)["status"], "approved")
+        self.assertFalse(any(c[1].endswith("/media_publish") for c in h.calls))
+
+    def test_real_publish_updates_row(self):
+        self.m.settings["mkt_dry_run"] = "0"
+        pid = self.post()
+        ok, msg = ig.publish_post(self.m, pid, FakeHttp(), lambda s: None)
+        r = self.row(pid)
+        self.assertTrue(ok, msg)
+        self.assertEqual((r["status"], r["ig_media_id"], r["ig_permalink"]), ("published", "MEDIA1", "https://instagram.com/p/XYZ/"))
+        self.assertTrue(r["published_at"])
+
+    def test_rolling_24h_cap(self):
+        self.m.settings["mkt_dry_run"] = "0"
+        for _ in range(39):
+            self.post(status="published", published_ago_hours=3)
+        for _ in range(5):
+            self.post(status="published", published_ago_hours=30)       # older than 24h: does not count
+        pid = self.post()
+        h = FakeHttp()
+        self.assertTrue(ig.publish_post(self.m, pid, h, lambda s: None)[0])   # 39 + this one = 40 is allowed
+        pid2 = self.post()
+        h2 = FakeHttp()
+        ok, msg = ig.publish_post(self.m, pid2, h2, lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("Daily limit", msg)
+        self.assertEqual(h2.calls, [])                                   # blocked locally, no HTTP
+        self.assertEqual(self.row(pid2)["status"], "approved")           # still waiting, not failed
+
+    def test_instagram_side_quota_blocks(self):
+        ok, msg = ig.publish_post(self.m, self.post(), FakeHttp(quota=40), lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("40 posts", msg)
+
+    def test_failure_marks_failed_with_message_and_retry_gate(self):
+        self.m.settings["mkt_dry_run"] = "0"
+        pid = self.post()
+        ok, msg = ig.publish_post(self.m, pid, FakeHttp(fail="media"), lambda s: None)
+        r = self.row(pid)
+        self.assertFalse(ok)
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("could not process", r["error"])
+        self.assertTrue(mq.can_publish(r))                               # a failed (previously approved) post can be retried
+
+    def test_missing_settings(self):
+        self.m.env_val = lambda k: ""
+        ok, msg = ig.publish_post(self.m, self.post(), FakeHttp(), lambda s: None)
+        self.assertFalse(ok)
+        self.assertIn("Missing settings", msg)
 
 
 if __name__ == "__main__":
