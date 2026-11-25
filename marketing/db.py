@@ -1,0 +1,92 @@
+"""Marketing tables (brands, products, posts). Migration-safe: every call may be re-run."""
+import re, pathlib, json, datetime
+
+ROOT = pathlib.Path(__file__).resolve().parent
+ASSETS = ROOT / "assets"
+OUT_ROOT = pathlib.Path(r"D:\vault\outputs\marketing")
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS brands(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, logo_path TEXT DEFAULT '', accent TEXT DEFAULT '#f5a524',
+  bg TEXT DEFAULT '#0b0b0c', footer_left TEXT DEFAULT '', footer_right TEXT DEFAULT '', ig_handle TEXT DEFAULT '', notes TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id INTEGER NOT NULL, name TEXT NOT NULL, description TEXT DEFAULT '',
+  key_points TEXT DEFAULT '', price_note TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id INTEGER, product_id INTEGER, platforms TEXT DEFAULT 'instagram',
+  type TEXT DEFAULT 'post', topic TEXT DEFAULT '', caption TEXT DEFAULT '', hashtags TEXT DEFAULT '', description_alt TEXT DEFAULT '',
+  image_paths TEXT DEFAULT '[]', status TEXT DEFAULT 'draft', scheduled_at TEXT DEFAULT '', ig_media_id TEXT DEFAULT '', ig_permalink TEXT DEFAULT '',
+  error TEXT DEFAULT '', created_at TEXT DEFAULT '', approved_at TEXT DEFAULT '', published_at TEXT DEFAULT '');
+"""
+EXTRA_COLS = {"posts": [("template", "TEXT DEFAULT ''"), ("spec_json", "TEXT DEFAULT '{}'")]}
+
+# Demo data only: text comes from the owner's own pitch lines. Edit or delete in the Brand kit page.
+SEED = [
+    ("SFL", "#f5a524", "#0b0b0c", "SystemFriendly Labs", "Demo brand", "", "Demo brand. Replace with real details in the Brand kit.",
+     [("InventoryCloud", "Inventory software that helps a business keep track of stock, purchases and sales in one place.",
+       "Stock in one place\nPurchases and sales together\nBuilt for small businesses", ""),
+      ("HMS", "Hospital management software that helps a hospital manage patients, billing and reports in one place.",
+       "Patients in one place\nBilling and reports\nBuilt for hospitals", ""),
+      ("LIMS", "Laboratory software that helps a lab manage samples, billing and reports in one place.",
+       "Samples tracked\nReports in one place\nBuilt for labs", "")]),
+    ("BBMetals", "#f5a524", "#0b0b0c", "BBMetals", "Demo brand", "", "Demo brand with placeholder text. Replace with real details.",
+     [("Demo product", "Placeholder product. Describe what it really is before posting.", "Add real key points here", "")]),
+]
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-") or "brand"
+
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure(c):
+    c.executescript(SCHEMA)
+    for t, cols in EXTRA_COLS.items():
+        have = {r[1] for r in c.execute("PRAGMA table_info(%s)" % t)}
+        for name, decl in cols:
+            if name not in have:
+                c.execute("ALTER TABLE %s ADD COLUMN %s %s" % (t, name, decl))
+    if not c.execute("SELECT 1 FROM brands LIMIT 1").fetchone():
+        for name, ac, bg, fl, fr, ig, notes, prods in SEED:
+            cur = c.execute("INSERT INTO brands(name,accent,bg,footer_left,footer_right,ig_handle,notes) VALUES(?,?,?,?,?,?,?)",
+                            (name, ac, bg, fl, fr, ig, notes))
+            for p in prods:
+                c.execute("INSERT INTO products(brand_id,name,description,key_points,price_note) VALUES(?,?,?,?,?)", (cur.lastrowid,) + p)
+    c.commit()
+    for name, *_ in SEED:
+        (ASSETS / slug(name) / "photos").mkdir(parents=True, exist_ok=True)
+
+
+def brand_dir(brand):
+    return ASSETS / slug(brand["name"])
+
+
+def logo_file(brand):
+    """Absolute path of the brand's logo if one was uploaded (or sits in the folder), else None."""
+    p = (brand["logo_path"] or "").strip()
+    if p:
+        q = pathlib.Path(p)
+        if not q.is_absolute():
+            q = ROOT / p
+        if q.exists():
+            return q
+    d = brand_dir(brand)
+    for ext in IMG_EXT:
+        q = d / ("logo" + ext)
+        if q.exists():
+            return q
+    return None
+
+
+def product_photo(brand, product):
+    """Photo picked up automatically: assets/<brand>/photos/<product-slug>.<ext> (or any file starting with it)."""
+    if not product:
+        return None
+    d = brand_dir(brand) / "photos"
+    s = slug(product["name"])
+    if d.exists():
+        for f in sorted(d.iterdir()):
+            if f.suffix.lower() in IMG_EXT and f.stem.lower().startswith(s):
+                return f
+    return None

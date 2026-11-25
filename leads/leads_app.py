@@ -763,8 +763,44 @@ def run_campaign(cid):
         bc = BIZ_COUNTS.pop(cid, None)
         if bc:
             log(cid, "Master list: " + str(bc["new"]) + " new, " + str(bc["merged"]) + " merged into existing, " + str(bc["review"]) + " sent to review")
+        _log_timing(cid)
         log(cid, "=== Search finished: " + str(total) + " new leads ===")
         RUNNING.discard(cid)
+
+# --- Stage timing (observation only; wraps functions, no behaviour change) ---
+_TL = threading.local()
+STAGE_SECS = {}
+_STAGES = {"osm_fetch": "OSM/Overpass", "web": "web search", "relevant": "AI relevance",
+           "find_phones": "find_phones", "upsert_business": "DB writes", "enrich_businesses": "website enrichment"}
+
+def _timed(fn, stage):
+    def w(*a, **k):
+        cid = getattr(_TL, "cid", None)
+        if cid is None:
+            return fn(*a, **k)
+        st = _TL.__dict__.setdefault("stack", [])
+        t = time.time()
+        st.append(0.0)  # time spent in nested timed calls, so stages are exclusive
+        try:
+            return fn(*a, **k)
+        finally:
+            el = time.time() - t
+            inner = st.pop()
+            d = STAGE_SECS.setdefault(cid, {})
+            d[stage] = d.get(stage, 0.0) + max(0.0, el - inner)
+            if st:
+                st[-1] += el
+    return w
+
+def _log_timing(cid):
+    try:
+        d = STAGE_SECS.pop(cid, None)
+        if d:
+            log(cid, "Timing (seconds per stage): " + ", ".join(_STAGES[k] + " " + str(int(round(v))) for k, v in d.items()))
+    except Exception:
+        pass
+
+# --- end stage timing ---
 
 def draft_all(cid):
     if cid in RUNNING:
@@ -789,21 +825,140 @@ def draft_all(cid):
     finally:
         RUNNING.discard(cid)
 
-HEAD = """<!doctype html><html><head><meta charset='utf-8'><title>Lead Campaigns</title>
-<style>
-body{font-family:Arial,sans-serif;margin:0;background:#f5f6f8;color:#222}
-nav{position:fixed;top:0;left:0;bottom:0;width:200px;background:#1f2937;padding:16px 0;overflow:auto}nav .brand{font-weight:bold;color:#fff;padding:0 18px 14px;font-size:15px}nav a,nav span{display:block;padding:10px 18px;color:#cbd5e1;text-decoration:none;font-size:14px}nav a:hover{background:#374151;color:#fff}nav a.on{background:#2563eb;color:#fff}nav span.soon{color:#6b7280}
-.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}.tile{background:#fff;border-radius:8px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.1)}.tile b{display:block;font-size:28px}.tile small{color:#666}
-main{max-width:1250px;margin:20px 0 20px 200px;padding:0 24px}
-.card{background:#fff;border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
-input,textarea,select{width:100%;padding:8px;margin:4px 0 10px;box-sizing:border-box;border:1px solid #ccc;border-radius:4px;font-family:inherit}
-button,.btn{background:#2563eb;color:#fff;border:0;padding:8px 14px;border-radius:4px;cursor:pointer;text-decoration:none;display:inline-block;font-size:14px;margin-right:6px}
-.grey{background:#6b7280}
+APP_CSS = r""":root{--bg:#0b0b0c;--surface:#141416;--surface2:#1b1b1e;--border:#26262a;--text:#ededed;--muted:#8a8a90;--accent:#f5a524;--accent-ink:#1a1204;--ok:#34c759;--warn:#f5a524;--bad:#ff453a;--radius:14px;--shadow:0 4px 18px rgba(0,0,0,.35);--side:220px;color-scheme:dark}
+*{box-sizing:border-box}
+html{font-size:16px}
+body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;font-size:15px;line-height:1.5}
+a{color:var(--accent);text-decoration:none;transition:color .15s,opacity .15s}a:hover{opacity:.8;text-decoration:underline}
+h1,h2,h3,h4{color:var(--text);font-weight:650;letter-spacing:-.01em}h2{font-size:22px;margin:0 0 14px}h3{font-size:16px;margin:0 0 10px}
+small,.muted{color:var(--muted)}
+[hidden]{display:none!important}
+::selection{background:rgba(255,255,255,.22);color:inherit}
+.side{position:fixed;top:0;left:0;bottom:0;width:var(--side);background:var(--surface);border-right:1px solid var(--border);padding:18px 12px;overflow:auto;z-index:30;transition:transform .2s}
+.side .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;padding:2px 10px 18px;color:var(--text)}
+.side .brand i{width:26px;height:26px;border-radius:8px;background:var(--accent);display:inline-block}
+.side a{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:10px;color:var(--muted);font-size:14.5px;margin-bottom:2px;transition:background .15s,color .15s;text-decoration:none}
+.side a:hover{background:var(--surface2);color:var(--text);opacity:1;text-decoration:none}
+.side a.on{background:rgba(245,165,36,.14);color:var(--accent)}
+.side a svg{width:19px;height:19px;flex:none;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.side .sep{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:16px 12px 6px;opacity:.7}
+.wrap{margin-left:var(--side);min-height:100vh}
+.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;padding:12px 24px;background:rgba(11,11,12,.88);backdrop-filter:blur(8px);border-bottom:1px solid var(--border)}
+.top form{flex:1;max-width:460px;margin:0}
+.top input[type=search]{margin:0;background:var(--surface);border-radius:999px;padding:9px 16px}
+.top .sp{flex:1}
+.dot{display:inline-flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);white-space:nowrap}
+.dot b{width:10px;height:10px;border-radius:50%;background:var(--muted);display:inline-block;box-shadow:0 0 0 3px rgba(138,138,144,.15)}
+.dot.green b{background:var(--ok);box-shadow:0 0 0 3px rgba(52,199,89,.18)}.dot.amber b{background:var(--warn);box-shadow:0 0 0 3px rgba(245,165,36,.18)}.dot.red b{background:var(--bad);box-shadow:0 0 0 3px rgba(255,69,58,.18)}
+.date{font-size:13px;color:var(--muted);white-space:nowrap}
+#menubtn{display:none;margin:0;padding:8px 10px;background:var(--surface);color:var(--text);border:1px solid var(--border)}
+main{max-width:1280px;margin:0 auto;padding:24px}
+@media(max-width:820px){.side{transform:translateX(-100%)}.side.open{transform:none;box-shadow:var(--shadow)}.wrap{margin-left:0}#menubtn{display:inline-flex}.top{padding:10px 14px;gap:8px}.date{display:none}main{padding:16px 14px}.card{overflow-x:auto}}
+.card,.tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:16px;box-shadow:var(--shadow)}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}
+.tile{margin:0;transition:border-color .15s}.tile:hover{border-color:#3a3a40}
+.tile b{display:block;font-size:28px;font-weight:700}.tile small{color:var(--muted)}
+input,textarea,select{width:100%;padding:9px 12px;margin:4px 0 10px;background:var(--surface2);color:var(--text);border:1px solid var(--border);border-radius:10px;font:inherit;transition:border-color .15s,box-shadow .15s;accent-color:var(--accent)}
+input::placeholder,textarea::placeholder{color:#5d5d63}
+input[type=checkbox],input[type=radio]{width:auto;margin:0 6px 0 0}
+input[type=range]{padding:0;background:transparent}
+select option{background:var(--surface2);color:var(--text)}
+input:focus,textarea:focus,select:focus,button:focus-visible,.btn:focus-visible,a:focus-visible{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(245,165,36,.28)}
+button,.btn{background:var(--accent);color:var(--accent-ink);border:0;padding:9px 16px;border-radius:10px;cursor:pointer;text-decoration:none;display:inline-block;font:inherit;font-size:14px;font-weight:600;margin-right:6px;transition:filter .15s,background .15s,transform .15s}
+button:hover,.btn:hover{filter:brightness(1.1);text-decoration:none;opacity:1}button:active,.btn:active{transform:scale(.98)}
+button:disabled{opacity:.5;cursor:default}
+.grey,.ghost{background:transparent;color:var(--text);border:1px solid var(--border)}.grey:hover,.ghost:hover{background:var(--surface2);filter:none}
 table{width:100%;border-collapse:collapse}
-th,td{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top;font-size:14px}
-pre{background:#111;color:#9fe29f;padding:10px;max-height:260px;overflow:auto;font-size:13px;border-radius:6px;white-space:pre-wrap}
-small{color:#666}
-</style></head><body><nav><div class='brand'>Command Centre</div><a href='/' class='{{"on" if request.path=="/"}}'>Home</a><a href='/campaigns' class='{{"on" if request.path.startswith("/campaign")}}'>Campaigns</a><a href='/leads' class='{{"on" if request.path=="/leads"}}'>All leads</a><a href='/businesses' class='{{"on" if request.path.startswith("/businesses")}}'>Businesses</a><a href='/digests' class='{{"on" if request.path.startswith("/digests")}}'>Digests</a><a href='/notes' class='{{'on' if request.path=='/notes'}}'>Notes</a><a href='/research' class='{{'on' if request.path.startswith('/research')}}'>Research</a><a href='/testing' class='{{'on' if request.path.startswith('/testing')}}'>Testing</a><a href='/queue' class='{{"on" if request.path.startswith("/queue")}}'>Queue</a><a href='/system' class='{{"on" if request.path=="/system"}}'>System</a></nav><main>"""
+th,td{border-bottom:1px solid var(--border);padding:9px 8px;text-align:left;vertical-align:top;font-size:14px}
+th{color:var(--muted);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em}
+tr{transition:background .15s}table tr:hover td{background:rgba(255,255,255,.02)}
+pre{background:#070708;color:#c9c9cf;border:1px solid var(--border);padding:12px;max-height:260px;overflow:auto;font-size:13px;border-radius:10px;white-space:pre-wrap}
+code{background:var(--surface2);padding:1px 6px;border-radius:6px}
+hr{border:0;border-top:1px solid var(--border)}
+.chip,.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--surface2);color:var(--muted);border:1px solid var(--border)}
+.chip.ok{color:var(--ok);border-color:var(--ok);background:transparent}.chip.warn{color:var(--warn);border-color:var(--warn);background:transparent}.chip.bad{color:var(--bad);border-color:var(--bad);background:transparent}
+.bar{height:8px;background:var(--surface2);border-radius:99px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .3s}
+.sy .ban{color:#fff}.sy .ban.green{background:#1f7a3d}.sy .ban.amber{background:#9a6a00}.sy .ban.red{background:#b5322a}
+.sy .hc{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+.sy .pill{border:0}.sy .pill.green{background:var(--ok);color:#06210e}.sy .pill.amber{background:var(--warn);color:var(--accent-ink)}.sy .pill.red{background:var(--bad);color:#fff}.sy .pill.grey{background:var(--surface2);color:var(--muted)}
+.sy .bar{background:var(--surface2)}.sy .bar i{background:var(--accent)}
+.sy .sug{background:rgba(245,165,36,.08);border:1px solid rgba(245,165,36,.35)}
+.sy .help,.sy small{color:var(--muted)}.sy .prob{border-color:var(--border)}
+.g2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:16px}.g2 .card{margin:0}
+.stat b{font-size:26px}.stat .sub{font-size:12.5px;color:var(--muted)}.stat svg{display:block;width:100%;height:34px;margin-top:8px}
+.attn{display:flex;flex-direction:column;gap:8px;margin-bottom:16px}
+.attn div{padding:11px 14px;border-radius:12px;background:var(--surface);border:1px solid var(--border);border-left:4px solid var(--warn)}
+.attn div.red{border-left-color:var(--bad)}.attn div.green{border-left-color:var(--ok)}
+.feed{list-style:none;margin:0;padding:0}.feed li{display:flex;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:14px}.feed li:last-child{border:0}.feed time{color:var(--muted);font-size:12.5px;min-width:92px}
+.chart text{fill:var(--muted);font-size:11px}
+.hb{display:flex;align-items:center;gap:8px;font-size:13px;margin:5px 0}.hb span:first-child{width:38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hb .bar{flex:1}.hb span:last-child{width:34px;text-align:right;color:var(--muted)}
+.ring{display:flex;align-items:center;gap:18px}.ring svg{width:120px;height:120px;flex:none}
+"""
+
+_ICON = {
+ "mkt": "<path d='M3 11v2a1 1 0 0 0 1 1h3l5 4V6L7 10H4a1 1 0 0 0-1 1zM16 9a4 4 0 0 1 0 6M19 6a8 8 0 0 1 0 12'/>",
+ "home": "<path d='M3 11l9-8 9 8v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z'/>",
+ "camp": "<circle cx='12' cy='12' r='9'/><circle cx='12' cy='12' r='5'/><circle cx='12' cy='12' r='1'/>",
+ "queue": "<path d='M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'/>",
+ "biz": "<rect x='4' y='3' width='16' height='18' rx='2'/><path d='M9 7h2M13 7h2M9 11h2M13 11h2M10 21v-4h4v4'/>",
+ "sys": "<path d='M22 12h-4l-3 9L9 3l-3 9H2'/>",
+ "test": "<circle cx='12' cy='12' r='9'/><path d='M9 12l2 2 4-4'/>",
+ "leads": "<path d='M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2'/><circle cx='10' cy='7' r='4'/>",
+ "mail": "<rect x='3' y='5' width='18' height='14' rx='2'/><path d='M3 7l9 6 9-6'/>",
+ "note": "<path d='M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z'/><path d='M14 3v6h6'/>",
+ "find": "<circle cx='11' cy='11' r='7'/><path d='M21 21l-4.3-4.3'/>",
+}
+
+def _nav(path):
+    items = [("/", "Home", "home", path == "/"),
+             ("/campaigns", "Campaigns", "camp", path.startswith("/campaign")),
+             ("/queue", "Queue", "queue", path.startswith("/queue")),
+             ("/marketing", "Marketing", "mkt", path.startswith("/marketing")),
+             ("/businesses", "Businesses", "biz", path.startswith("/businesses")),
+             ("/system", "System", "sys", path == "/system"),
+             ("/testing", "Testing", "test", path.startswith("/testing")),
+             None,
+             ("/leads", "All leads", "leads", path == "/leads"),
+             ("/digests", "Digests", "mail", path.startswith("/digests")),
+             ("/notes", "Notes", "note", path == "/notes"),
+             ("/research", "Research", "find", path.startswith("/research"))]
+    out = []
+    for it in items:
+        if it is None:
+            out.append("<div class='sep'>More</div>")
+            continue
+        out.append("<a href='%s'%s><svg viewBox='0 0 24 24'>%s</svg>%s</a>" % (it[0], " class='on'" if it[3] else "", _ICON[it[2]], it[1]))
+    return "".join(out)
+
+@app.context_processor
+def _shell_ctx():
+    return {"navhtml": _nav(request.path)}
+
+@app.route("/static/app.css")
+def app_css():
+    return Response(APP_CSS, mimetype="text/css", headers={"Cache-Control": "no-cache"})
+
+HEAD = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Command Centre</title>
+<link rel='stylesheet' href='/static/app.css'>
+</head><body>
+<aside class='side' id='side'><div class='brand'><i></i>Command Centre</div>{{navhtml|safe}}</aside>
+<div class='wrap'><header class='top'>
+<button type='button' id='menubtn' aria-label='Menu' onclick="document.getElementById('side').classList.toggle('open')"><svg viewBox='0 0 24 24' width='20' height='20' style='stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round'><path d='M4 6h16M4 12h16M4 18h16'/></svg></button>
+<form action='/businesses' method='get'><input type='search' name='q' placeholder='Search business, phone or city' aria-label='Search businesses'></form>
+<span class='sp'></span>
+<span class='dot' id='dot' title='Queue and system status'><b></b><span id='dottxt'>Checking</span></span>
+<span class='date' id='today'></span></header>
+<script>
+(function(){
+var d=new Date();document.getElementById('today').textContent=d.toLocaleDateString(undefined,{weekday:'short',day:'numeric',month:'short',year:'numeric'});
+window.liveTick=function(){fetch('/api/home/live').then(function(r){return r.json()}).then(function(j){
+ var e=document.getElementById('dot');e.className='dot '+j.dot.color;document.getElementById('dottxt').textContent=j.dot.label;
+ if(window.onLive)window.onLive(j);}).catch(function(){});};
+window.liveTick();setInterval(window.liveTick,15000);
+})();
+</script>
+<main>"""
+
 
 HOME = HEAD + """
 <div class='card'><h2>New campaign</h2>
@@ -838,8 +993,8 @@ fillStates();
 </script></main></body></html>"""
 
 CAMP = HEAD + """
-<div style='display:flex;gap:8px;margin:0 0 16px;border-bottom:1px solid #e5e7eb'><a href='/campaign/{{c.id}}' style='padding:8px 16px;text-decoration:none;color:#2563eb;border-bottom:2px solid #2563eb;font-weight:600'>Leads</a><a href='/campaign/{{c.id}}/outreach' style='padding:8px 16px;text-decoration:none;color:#4b5563;font-weight:600'>Outreach</a></div>
-{% if pre.get('state')=='ask' %}<div class='card' style='border-left:4px solid #2563eb'>
+<div style='display:flex;gap:8px;margin:0 0 16px;border-bottom:1px solid var(--border)'><a href='/campaign/{{c.id}}' style='padding:8px 16px;text-decoration:none;color:var(--accent);border-bottom:2px solid var(--accent);font-weight:600'>Leads</a><a href='/campaign/{{c.id}}/outreach' style='padding:8px 16px;text-decoration:none;color:var(--muted);font-weight:600'>Outreach</a></div>
+{% if pre.get('state')=='ask' %}<div class='card' style='border-left:4px solid var(--accent)'>
 <h3>You already have {{pre.n}} businesses for this search.</h3>
 <p>Last updated {{pre.last}}. They are saved in your master list.</p>
 <form method='post' action='/campaign/{{c.id}}/prestart'><button name='choice' value='use'>Use these</button>
@@ -935,7 +1090,7 @@ DASH = HEAD + """
 <tr><td>Running now</td><td>{% if running %}{% for r in running %}<a href='/campaign/{{r.id}}'>{{r.name}}</a> {% endfor %}{% else %}Nothing running{% endif %}</td></tr>
 </table></div>
 <div class='card'><h3>Reminders</h3>
-{% if reminders %}<table>{% for n in reminders %}<tr><td style='width:130px'><b style='color:{{'#b91c1c' if n.state=='overdue' else '#222'}}'>{{n.pretty}}</b><br><small>{{n.state}}</small></td><td style='white-space:pre-wrap'>{{n.text[:200]}}</td><td style='width:70px'><a href='/notes'>Open</a></td></tr>{% endfor %}</table>
+{% if reminders %}<table>{% for n in reminders %}<tr><td style='width:130px'><b style='color:{{'var(--bad)' if n.state=='overdue' else 'var(--text)'}}'>{{n.pretty}}</b><br><small>{{n.state}}</small></td><td style='white-space:pre-wrap'>{{n.text[:200]}}</td><td style='width:70px'><a href='/notes'>Open</a></td></tr>{% endfor %}</table>
 {% else %}<p>No reminders due in the next 14 days. <a href='/notes'>Add a note</a>.</p>{% endif %}</div>
 <div class='card'><h3>Pipeline</h3><table><tr>{% for st in statuses %}<th>{{st}}</th>{% endfor %}</tr>
 <tr>{% for st in statuses %}<td>{{counts.get(st,0)}}</td>{% endfor %}</tr></table></div>
@@ -975,7 +1130,7 @@ function save(id){
 }
 </script></main></body></html>"""
 
-@app.route("/")
+@app.route("/overview")
 def dashboard():
     ensure_notes()
     c = conn()
@@ -992,6 +1147,236 @@ def dashboard():
     c.close()
     return render_template_string(DASH, reminders=reminders, n_camp=n_camp, n_leads=n_leads, new_week=new_week, worked=worked, counts=counts,
                                   recent=recent, running=running, statuses=STATUSES, **status_info())
+
+
+# ---------------- Home (read-only) ----------------
+_OVC = {"t": 0, "v": None}
+
+def _ov_cached():
+    if time.time() - _OVC["t"] > 30 or _OVC["v"] is None:
+        try:
+            _OVC["v"] = sys_overview()
+        except Exception:
+            _OVC["v"] = None
+        _OVC["t"] = time.time()
+    return _OVC["v"]
+
+def _days14():
+    t = datetime.date.today()
+    return [(t - datetime.timedelta(days=i)).isoformat() for i in range(13, -1, -1)]
+
+def _series(c, sql, args=()):
+    days = _days14()
+    got = {}
+    try:
+        for r in c.execute(sql, (days[0],) + tuple(args)):
+            got[str(r[0])[:10]] = r[1]
+    except Exception:
+        return None
+    return [got.get(d, 0) for d in days]
+
+def _spark(vals):
+    if not vals:
+        return ""
+    w, h, mx = 120.0, 34.0, max(max(vals), 1)
+    pts = [(i * w / (len(vals) - 1), h - 3 - (v / mx) * (h - 8)) for i, v in enumerate(vals)]
+    line = " ".join("%.1f,%.1f" % p for p in pts)
+    area = "0,%.0f %s %.0f,%.0f" % (h, line, w, h)
+    return ("<svg viewBox='0 0 120 34' preserveAspectRatio='none' aria-hidden='true'><polygon points='%s' fill='#f5a524' opacity='.14'/>"
+            "<polyline points='%s' fill='none' stroke='#f5a524' stroke-width='1.8' stroke-linejoin='round' vector-effect='non-scaling-stroke'/></svg>") % (area, line)
+
+def _daybars(vals):
+    days = _days14()
+    mx = max(max(vals), 1)
+    W, H, pad = 560.0, 170.0, 22.0
+    bw = W / len(vals)
+    out = ["<svg class='chart' viewBox='0 0 560 %d' style='width:100%%;height:auto' role='img' aria-label='Leads added per day'>" % int(H + 22)]
+    for i, v in enumerate(vals):
+        bh = (v / mx) * (H - pad)
+        x = i * bw + 4
+        out.append("<rect x='%.1f' y='%.1f' width='%.1f' height='%.1f' rx='4' fill='#f5a524' opacity='%s'><title>%s: %d</title></rect>" % (x, H - bh, bw - 8, max(bh, 1.5), "1" if i == len(vals) - 1 else ".6", days[i], v))
+        if v:
+            out.append("<text x='%.1f' y='%.1f' text-anchor='middle'>%d</text>" % (x + (bw - 8) / 2, H - bh - 4, v))
+        if i % 2 == 1 or i == len(vals) - 1:
+            out.append("<text x='%.1f' y='%d' text-anchor='middle'>%s</text>" % (x + (bw - 8) / 2, int(H + 16), days[i][5:]))
+    out.append("</svg>")
+    return "".join(out)
+
+def _ring(pct):
+    r, circ = 48.0, 2 * 3.14159265 * 48.0
+    return ("<svg viewBox='0 0 120 120' role='img' aria-label='Phone coverage %d percent'><circle cx='60' cy='60' r='48' fill='none' stroke='#26262a' stroke-width='12'/>"
+            "<circle cx='60' cy='60' r='48' fill='none' stroke='#f5a524' stroke-width='12' stroke-linecap='round' stroke-dasharray='%.1f %.1f' transform='rotate(-90 60 60)'/>"
+            "<text x='60' y='66' text-anchor='middle' font-size='22' font-weight='700' fill='#ededed'>%d%%</text></svg>") % (pct, circ * pct / 100.0, circ, pct)
+
+def home_live():
+    c = conn()
+    d = {"camp": None, "next": "", "wait": 0, "done": 0, "failed": 0, "paused": False, "cont": False}
+    try:
+        d["paused"] = qset("paused", "0") == "1"
+        d["cont"] = qset("continuous", "1") == "1"
+    except Exception:
+        pass
+    try:
+        for r in c.execute("SELECT status, COUNT(*) n FROM queue GROUP BY status"):
+            if r["status"] in ("pending", "done", "failed"):
+                d[{"pending": "wait"}.get(r["status"], r["status"])] = r["n"]
+        nx = c.execute("SELECT entity, place FROM queue WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+        if nx:
+            d["next"] = "%s in %s" % (first_term(nx["entity"]), nx["place"])
+    except Exception:
+        pass
+    try:
+        run = sorted(RUNNING)
+        if run:
+            cid = run[-1]
+            camp = c.execute("SELECT * FROM campaigns WHERE id=?", (cid,)).fetchone()
+            if camp:
+                n = c.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=? AND wrong=0", (cid,)).fetchone()[0]
+                mx = camp["max_leads"] or 0
+                with LOCK:
+                    lines = list(LOGS.get(cid, []))
+                d["camp"] = {"id": cid, "name": camp["name"], "place": (camp["location"] or "").split(",")[0].strip(),
+                             "found": n, "max": mx, "pct": min(100, round(100.0 * n / mx)) if mx else 0,
+                             "line": lines[-1] if lines else "Starting"}
+    except Exception:
+        pass
+    c.close()
+    ov = _ov_cached()
+    if ov and ov["banner"][0] == "red":
+        d["dot"] = {"color": "red", "label": "Needs attention"}
+    elif d["paused"]:
+        d["dot"] = {"color": "amber", "label": "Paused"}
+    elif ov and ov["banner"][0] == "amber":
+        d["dot"] = {"color": "amber", "label": "Slow"}
+    elif d["camp"]:
+        d["dot"] = {"color": "green", "label": "Running"}
+    else:
+        d["dot"] = {"color": "green", "label": "Idle"}
+    return d
+
+@app.route("/api/home/live")
+def api_home_live():
+    try:
+        return jsonify(home_live())
+    except Exception:
+        return jsonify(dot={"color": "amber", "label": "Unknown"}, camp=None, next="", wait=0, done=0, failed=0, paused=False, cont=False)
+
+def home_data():
+    H = {}
+    ensure_businesses()
+    c = conn()
+    try:
+        t = c.execute("SELECT COUNT(*) n, COALESCE(SUM(phones<>'[]'),0) ph, COALESCE(SUM(emails<>'[]'),0) em FROM businesses WHERE status<>'wrong'").fetchone()
+        tot, ph, em = t["n"] or 0, t["ph"], t["em"]
+        today = datetime.date.today().isoformat()
+        add = _series(c, "SELECT first_seen, COUNT(*) FROM businesses WHERE status<>'wrong' AND first_seen>=? GROUP BY 1")
+        addph = _series(c, "SELECT first_seen, COUNT(*) FROM businesses WHERE status<>'wrong' AND phones<>'[]' AND first_seen>=? GROUP BY 1")
+        addem = _series(c, "SELECT first_seen, COUNT(*) FROM businesses WHERE status<>'wrong' AND emails<>'[]' AND first_seen>=? GROUP BY 1")
+        cum = None
+        if add is not None:
+            cum, run = [], tot - sum(add)
+            for v in add:
+                run += v
+                cum.append(run)
+        done = _series(c, "SELECT substr(last_run,1,10), COUNT(*) FROM queue WHERE status='done' AND substr(last_run,1,10)>=? GROUP BY 1")
+        ndone = c.execute("SELECT COUNT(*) FROM queue WHERE status='done'").fetchone()[0]
+        pc = lambda x: round(100.0 * x / tot) if tot else 0
+        cards = [("Businesses", "{:,}".format(tot), "in the master list", cum),
+                 ("With phone", "{:,}".format(ph), "%d%% of all" % pc(ph), addph),
+                 ("With email", "{:,}".format(em), "%d%% of all" % pc(em), addem),
+                 ("Added today", str(add[-1]) if add else "0", "last 14 days: %d" % sum(add or [0]), add),
+                 ("Campaigns done", str(ndone), "queue items finished", done)]
+        H["cards"] = [(a, b, s, _spark(v) if v else "") for a, b, s, v in cards]
+        H["tot"], H["pc_phone"] = tot, pc(ph)
+        if add is not None:
+            H["daybars"] = _daybars(add)
+        cities = c.execute("SELECT city, COUNT(*) n FROM businesses WHERE status<>'wrong' AND city<>'' GROUP BY city ORDER BY n DESC LIMIT 8").fetchall()
+        if cities:
+            mx = cities[0]["n"]
+            H["cities"] = [(r["city"], r["n"], round(100.0 * r["n"] / mx)) for r in cities]
+        cats = c.execute("SELECT category, COUNT(*) n FROM businesses WHERE status<>'wrong' AND category<>'' GROUP BY category ORDER BY n DESC LIMIT 8").fetchall()
+        if cats:
+            mx = cats[0]["n"]
+            H["cats"] = [(r["category"], r["n"], round(100.0 * r["n"] / mx)) for r in cats]
+        if tot:
+            H["ring"] = _ring(pc(ph))
+    except Exception:
+        pass
+    ev = []
+    for sql, fn in (
+        ("SELECT last_run, entity, place, leads_found, status FROM queue WHERE status IN ('done','failed') AND last_run<>'' ORDER BY last_run DESC LIMIT 10",
+         lambda r: (r[0], "Search %s: %s in %s (%d leads)" % ("finished" if r[4] == "done" else "failed", first_term(r[1]), r[2], r[3] or 0))),
+        ("SELECT created, name FROM campaigns ORDER BY id DESC LIMIT 10", lambda r: (r[0], "Campaign started: %s" % r[1])),
+        ("SELECT ts, examined, updated, phones_added, emails_added FROM enrich_log ORDER BY id DESC LIMIT 10",
+         lambda r: (r[0], "Website enrichment: %d checked, %d updated (+%d phones, +%d emails)" % (r[1], r[2], r[3], r[4]))),
+        ("SELECT ts, tried, phones, emails FROM backfill_log ORDER BY id DESC LIMIT 10",
+         lambda r: (r[0], "Backfill run: %s tried, +%s phones, +%s emails" % (r[1], r[2], r[3]))),
+    ):
+        try:
+            for r in c.execute(sql):
+                ts, txt = fn(r)
+                ev.append((str(ts)[:16], txt))
+        except Exception:
+            pass
+    c.close()
+    ev.sort(key=lambda e: e[0], reverse=True)
+    H["events"] = ev[:10]
+    att = []
+    try:
+        ov = _ov_cached()
+        if ov:
+            if not ov["worker"]:
+                att.append(("red", "The background queue worker has stopped, so nothing will run until the app is restarted."))
+            for h_ in ov["helpers"]:
+                if h_["cls"] == "red":
+                    att.append(("red", "%s is out of its free limit today; other helpers will take over." % h_["name"]))
+            if ov["now"]["paused"] and ov["now"]["wait"]:
+                att.append(("amber", "The queue is paused with %d item(s) waiting." % ov["now"]["wait"]))
+            if ov["now"]["failed"]:
+                att.append(("amber", "%d queue item(s) failed and can be retried on the Queue page." % ov["now"]["failed"]))
+        if H.get("tot", 0) >= 20 and H.get("pc_phone", 100) < 50:
+            att.append(("amber", "Only %d%% of businesses have a phone number; run Enrich websites." % H["pc_phone"]))
+    except Exception:
+        pass
+    att.sort(key=lambda a: a[0] != "red")
+    H["attn"] = att[:3]
+    return H
+
+HOMEPAGE = HEAD + """
+<h2 style='margin-top:0'>Home</h2>
+{% if h.attn %}<div class='attn'>{% for k, t in h.attn %}<div class='{{k}}'>{{t}}</div>{% endfor %}</div>
+{% else %}<div class='attn'><div class='green'>All clear. Nothing needs your attention.</div></div>{% endif %}
+{% if h.cards %}<div class='tiles'>{% for a, b, s, sp in h.cards %}<div class='tile stat'><small>{{a}}</small><b>{{b}}</b><span class='sub'>{{s}}</span>{{sp|safe}}</div>{% endfor %}</div>{% endif %}
+<div class='card' id='livecard'><h3>Right now</h3><div id='live'><span class='muted'>Loading</span></div></div>
+<div class='g2'>
+{% if h.daybars %}<div class='card'><h3>Leads added per day</h3>{{h.daybars|safe}}</div>{% endif %}
+{% if h.ring %}<div class='card'><h3>Phone coverage</h3><div class='ring'>{{h.ring|safe}}<div><b style='font-size:22px'>{{h.pc_phone}}%</b><br><small>of {{'{:,}'.format(h.tot)}} businesses have a phone number</small></div></div></div>{% endif %}
+{% if h.cities %}<div class='card'><h3>Top cities</h3>{% for n, v, p in h.cities %}<div class='hb'><span>{{n}}</span><div class='bar'><i style='width:{{p}}%'></i></div><span>{{v}}</span></div>{% endfor %}</div>{% endif %}
+{% if h.cats %}<div class='card'><h3>Leads by category</h3>{% for n, v, p in h.cats %}<div class='hb'><span>{{n}}</span><div class='bar'><i style='width:{{p}}%'></i></div><span>{{v}}</span></div>{% endfor %}</div>{% endif %}
+</div>
+{% if h.events %}<div class='card'><h3>Recent activity</h3><ul class='feed'>{% for ts, t in h.events %}<li><time>{{ts}}</time><span>{{t}}</span></li>{% endfor %}</ul></div>{% endif %}
+<script>
+function esc(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+window.onLive=function(j){
+ var h='';
+ if(j.camp){var c=j.camp;
+  h='<div><b>'+esc(c.name)+'</b> <span class="chip ok">Running</span></div><div class="muted" style="margin:4px 0 10px">'+esc(c.place)+' &middot; '+c.found+(c.max?' of '+c.max:'')+' leads found</div>'
+   +'<div class="bar"><i style="width:'+c.pct+'%"></i></div><pre style="margin:12px 0 0;max-height:70px">'+esc(c.line)+'</pre><div style="margin-top:8px"><a href="/campaign/'+c.id+'">Open campaign</a></div>';
+ }else{
+  h='<div><b>Idle</b> '+(j.paused?'<span class="chip warn">Queue paused</span>':'')+'</div><div class="muted" style="margin-top:6px">'
+   +(j.next?'Next in queue: '+esc(j.next):'Nothing waiting in the queue.')+'</div><div class="muted" style="margin-top:4px">'+j.wait+' waiting &middot; '+j.done+' done &middot; '+j.failed+' failed &middot; <a href="/queue">Open queue</a></div>';
+ }
+ document.getElementById('live').innerHTML=h;
+};
+</script></main></body></html>"""
+
+@app.route("/")
+def home():
+    try:
+        h = home_data()
+    except Exception:
+        h = {"attn": [], "events": []}
+    return render_template_string(HOMEPAGE, h=h)
 
 @app.route("/leads")
 def all_leads():
@@ -1053,7 +1438,7 @@ DIG = HEAD + """
 {% if files %}
 <p>{% for f in files %}<a class='btn {{'' if f==sel else 'grey'}}' href='?d={{f}}' style='margin-bottom:6px'>{{f[7:17]}}</a>{% endfor %}</p>
 <p><a href='/digests/view/{{sel}}' target='_blank'>Open full page</a></p>
-<iframe src='/digests/view/{{sel}}' style='width:100%;height:720px;border:1px solid #ddd;border-radius:6px;background:#fff'></iframe>
+<iframe src='/digests/view/{{sel}}' style='width:100%;height:720px;border:1px solid var(--border);border-radius:6px;background:#fff'></iframe>
 {% else %}<p>No digests yet. Click Run digest now.</p>{% endif %}</div>
 <script>
 var schedOn=false;
@@ -1235,12 +1620,12 @@ NOTES = HEAD + """
 <select name='show' style='margin:0;width:200px'><option value=''>All notes</option><option value='open' {{'selected' if show=='open'}}>Open reminders</option><option value='done' {{'selected' if show=='done'}}>Done</option></select>
 <button style='margin:0'>Search</button></form>
 {% for n in notes %}
-<div style='border-top:1px solid #e5e7eb;padding:10px 0'>
+<div style='border-top:1px solid var(--border);padding:10px 0'>
 <div style='white-space:pre-wrap'>{{n.text}}</div>
 <small>{{n.created}}{% if n.tags %} &nbsp;|&nbsp; {{n.tags}}{% endif %}</small>
 <div style='margin-top:6px;display:flex;gap:8px;align-items:center'>
 <span>Remind on:</span><input type='date' value='{{n.remind_on}}' onchange="setDate({{n.id}},this.value)" style='width:170px;margin:0'>
-{% if n.state=='overdue' %}<b style='color:#b91c1c'>Overdue</b>{% elif n.state=='today' %}<b style='color:#b45309'>Today</b>{% endif %}
+{% if n.state=='overdue' %}<b style='color:var(--bad)'>Overdue</b>{% elif n.state=='today' %}<b style='color:var(--warn)'>Today</b>{% endif %}
 {% if n.remind_on %}<button class='grey' onclick="setDone({{n.id}},{{0 if n.done else 1}})">{{'Reopen' if n.done else 'Mark done'}}</button>{% endif %}
 <button class='grey' onclick="del({{n.id}})">Delete</button></div></div>
 {% else %}<p>No notes yet.</p>{% endfor %}</div>
@@ -1478,7 +1863,7 @@ function delTest(id){if(confirm('Delete this test?')){fetch('/testing/delete/'+i
 
 RUNPAGE = HEAD + """
 <div class='card'><h3>{{name}} <small id='rst'></small></h3>
-<div id='cont' style='display:none;background:#fef3c7;padding:12px;border-radius:6px;margin-bottom:10px'>
+<div id='cont' style='display:none;background:var(--surface2);border:1px solid var(--border);padding:12px;border-radius:6px;margin-bottom:10px'>
 Chrome is waiting for you. Sign in in the Chrome window, then click Continue.
 <button onclick="cont()" style='margin-left:12px'>Continue</button></div>
 <table><tr><th>#</th><th>Step</th><th>Result</th><th>Note</th><th>Screenshot</th></tr><tbody id='rows'></tbody></table>
@@ -1494,7 +1879,7 @@ function render(j){
     var tr=document.createElement('tr');
     [r.n,r.step,r.status,r.note].forEach(function(v,idx){
       var td=document.createElement('td');td.textContent=v;
-      if(idx===2){td.style.fontWeight='bold';td.style.color=(r.status==='passed'?'#15803d':(r.status==='failed'?'#b91c1c':'#6b7280'));}
+      if(idx===2){td.style.fontWeight='bold';td.style.color=(r.status==='passed'?'#34c759':(r.status==='failed'?'var(--bad)':'#8a8a90'));}
       tr.appendChild(td);
     });
     var td=document.createElement('td');
@@ -1933,7 +2318,7 @@ RESPAGE = HEAD + """
 {% if (r.status=='failed' or (r.answer or '').startswith('(')) and sources %}<button onclick="rewrite()">Retry the AI step</button> {% endif %}<button onclick="toNote()">Save to Notes</button> <small id='nmsg'></small>
 {% endif %}</div>
 {% if sources %}<div class='card'><h3>Sources</h3>
-{% for x in sources %}<div style='padding:6px 0;border-top:1px solid #e5e7eb'><b>[{{x.n}}]</b> <a href='{{x.url}}' target='_blank'>{{x.title}}</a> <small>({{x.domain}}{% if not x.full %}, search snippet only{% endif %})</small><br><small>{{x.text[:220]}}...</small></div>{% endfor %}</div>{% endif %}
+{% for x in sources %}<div style='padding:6px 0;border-top:1px solid var(--border)'><b>[{{x.n}}]</b> <a href='{{x.url}}' target='_blank'>{{x.title}}</a> <small>({{x.domain}}{% if not x.full %}, search snippet only{% endif %})</small><br><small>{{x.text[:220]}}...</small></div>{% endfor %}</div>{% endif %}
 <p><a href='/research'>Back to research</a></p>
 <script>
 var RID={{r.id}};
@@ -2288,6 +2673,168 @@ def ai_usage():
     share = ("cloud %d%% / local %d%% (%d answers today)" % (round(100 * cloud / tot), round(100 * local / tot), tot)) if tot else "no answers yet today"
     return out, share
 
+AI_DAILY_LIMIT = {"groq": 1000, "gemini": 250, "openrouter": 50, "ollama": None}   # display-only planning limits (free tiers vary)
+AI_LABEL = {"groq": ("Groq", "Main helper: very fast, free daily limit"),
+            "gemini": ("Gemini", "Backup helper: good quality, free daily limit"),
+            "openrouter": ("OpenRouter", "Second backup: free models, small daily limit"),
+            "ollama": ("Local", "Private data only, slower, free")}
+
+def plain_error(err):
+    e = (err or "").lower()
+    who = "An AI helper"
+    for k, v in (("gemini", "Gemini"), ("groq", "Groq"), ("openrouter", "OpenRouter")):
+        if k in e:
+            who = v
+    if "429" in e or "quota" in e or "rate" in e or "exhaust" in e:
+        return who + " hit its free limit for now, so the next helper took over automatically"
+    if "503" in e or "overload" in e or "unavailable" in e or "high demand" in e:
+        return who + " was overloaded, so the next helper took over automatically"
+    if "401" in e or "403" in e or "api key" in e or "permission" in e:
+        return who + " refused the key, so it is resting; check the key if this repeats"
+    if "timeout" in e or "timed out" in e:
+        return who + " took too long to answer, so the next helper took over"
+    if "empty" in e:
+        return who + " gave an empty answer, so it was retried elsewhere"
+    if "all ai providers failed" in e:
+        return "Every AI helper failed at once; the work was retried later"
+    return who + " had a problem; the system carried on with another helper"
+
+def sys_overview():
+    import shutil
+    ov = {}
+    today = time.strftime("%Y-%m-%d")
+    ensure_businesses()
+    c = conn()
+    st = ai_router.status()
+    helpers = []
+    cloud_n = cloud_bad = 0
+    for p in ("groq", "gemini", "openrouter", "ollama"):
+        r = c.execute("SELECT COUNT(*) n, COALESCE(SUM(ok),0) ok FROM gemini_calls WHERE day=? AND kind IN ('call','digest') AND COALESCE(provider,'gemini')=?", (today, p)).fetchone()
+        n, ok = r["n"], r["ok"]
+        s = st[p]
+        lim = AI_DAILY_LIMIT[p]
+        cool = bool(s["cool"])
+        if not s["key"]:
+            word, cls = "Not set up", "grey"
+        elif (lim and n >= lim) or s["disabled"] or s.get("quota"):
+            word, cls = "Out of free limit today", "red"
+        elif cool or (n >= 5 and (n - ok) / n > 0.3):
+            word, cls = "Slow", "amber"
+        else:
+            word, cls = "Working", "green"
+        try:
+            avg = c.execute("SELECT AVG(latency_ms) FROM gemini_calls WHERE day=? AND ok=1 AND latency_ms>0 AND kind IN ('call','digest') AND COALESCE(provider,'gemini')=?", (today, p)).fetchone()[0]
+        except Exception:
+            avg = None
+        if not n:
+            speed = "not used yet today"
+        elif avg:
+            sec = avg / 1000.0
+            lab = "fast" if sec < 3 else ("medium" if sec < 10 else "slow")
+            speed = "%s (about %.1f s per answer)" % (lab, sec)
+        else:
+            speed = "slower (runs on this PC)" if p == "ollama" else ("slow right now" if word == "Slow" else "fast")
+        if p != "ollama":
+            cloud_n += n
+            cloud_bad += n - ok
+        name, note = AI_LABEL[p]
+        helpers.append({"name": name, "note": note, "word": word, "cls": cls, "n": n, "ok": ok, "lim": lim,
+                        "pct": min(100, round(100 * n / lim)) if lim else 0, "speed": speed})
+    fail_rate = (cloud_bad / cloud_n) if cloud_n else 0
+    ov["helpers"] = helpers
+    t = c.execute("SELECT COUNT(*) n, COALESCE(SUM(phones<>'[]'),0) ph, COALESCE(SUM(emails<>'[]'),0) em, COALESCE(SUM(website<>''),0) ws FROM businesses WHERE status<>'wrong'").fetchone()
+    week = (datetime.date.today() - datetime.timedelta(days=6)).isoformat()
+    td = c.execute("SELECT COUNT(*) FROM businesses WHERE first_seen>=?", (today,)).fetchone()[0]
+    wk = c.execute("SELECT COUNT(*) FROM businesses WHERE first_seen>=?", (week,)).fetchone()[0]
+    tot = t["n"] or 0
+    pc = lambda x: round(100 * x / tot) if tot else 0
+    ov["leads"] = {"total": tot, "td": td, "wk": wk,
+                   "bars": [("With a phone", t["ph"], pc(t["ph"])), ("With an email", t["em"], pc(t["em"])), ("With a website", t["ws"], pc(t["ws"]))]}
+    qc = {r["status"]: r["n"] for r in c.execute("SELECT status, COUNT(*) n FROM queue GROUP BY status")}
+    nxt = c.execute("SELECT entity, place FROM queue WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+    cont = qset("continuous", "1") == "1"
+    paused = qset("paused", "0") == "1"
+    camp = c.execute("SELECT * FROM campaigns ORDER BY id DESC LIMIT 1").fetchone()
+    now_line, last_camp_days = "", None
+    if camp:
+        try:
+            made = datetime.datetime.strptime(camp["created"], "%Y-%m-%d %H:%M")
+            last_camp_days = (datetime.datetime.now() - made).days
+        except Exception:
+            made = None
+        if camp["id"] in RUNNING:
+            n = c.execute("SELECT COUNT(*) FROM leads WHERE campaign_id=? AND wrong=0", (camp["id"],)).fetchone()[0]
+            mx = camp["max_leads"] or 0
+            what = first_term(camp["queries"] or "") or "businesses"
+            where = (camp["location"] or "").split(",")[0].strip()
+            now_line = "Searching for %s%s: %d%s leads found" % (what, " in " + where if where else "", n, " of %d" % mx if mx else "")
+            if made and mx and 0 < n < mx:
+                mins = (datetime.datetime.now() - made).total_seconds() / 60
+                left = int(mins * (mx - n) / n) + 1
+                now_line += ", about %d minute%s left" % (left, "" if left == 1 else "s")
+    if not now_line:
+        now_line = "Nothing is running right now."
+    ov["now"] = {"line": now_line, "done": qc.get("done", 0), "wait": qc.get("pending", 0), "failed": qc.get("failed", 0),
+                 "next": ("%s in %s" % (first_term(nxt["entity"]), nxt["place"])) if nxt else "", "cont": cont, "paused": paused}
+    probs = []
+    for r in c.execute("SELECT ts, provider, model, error FROM gemini_calls WHERE ok=0 AND error IS NOT NULL AND error<>'' ORDER BY id DESC LIMIT 5"):
+        probs.append({"ts": r["ts"], "text": plain_error((r["provider"] or "gemini") + " " + (r["error"] or "")), "raw": "%s | %s | %s" % (r["provider"] or "gemini", r["model"], r["error"])})
+    ov["probs"] = probs
+    c.close()
+    worker = any(getattr(t_, "_target", None) is queue_worker and t_.is_alive() for t_ in threading.enumerate())
+    try:
+        free_gb = shutil.disk_usage(str(BASE)).free / 1e9
+    except Exception:
+        free_gb = None
+    try:
+        db_mb = os.path.getsize(DB) / 1e6
+    except Exception:
+        db_mb = 0
+    red, amber = [], []
+    if not worker:
+        red.append("the background queue worker has stopped")
+    if free_gb is not None and free_gb < 2:
+        red.append("the disk is almost full (%.1f GB free)" % free_gb)
+    elif free_gb is not None and free_gb < 10:
+        amber.append("disk")
+    if db_mb > 2000:
+        red.append("the lead database is very large (%d MB)" % db_mb)
+    elif db_mb > 500:
+        amber.append("db")
+    if cloud_n >= 5 and fail_rate >= 0.8:
+        red.append("the AI helpers are mostly failing today")
+    elif cloud_n >= 5 and fail_rate > 0.3:
+        amber.append("ai")
+    if last_camp_days is not None and last_camp_days >= 7:
+        amber.append("old")
+    if red:
+        ov["banner"] = ("red", "Needs attention: " + "; ".join(red) + ".")
+    elif "ai" in amber:
+        ov["banner"] = ("amber", "Working, but AI is slow today.")
+    elif amber:
+        why = {"disk": "disk space is getting low", "db": "the lead database is getting big", "old": "no search has run for over a week"}
+        ov["banner"] = ("amber", "Working, but " + why[amber[0]] + ".")
+    else:
+        ov["banner"] = ("green", "Everything is running fine.")
+    sug = []
+    if tot >= 20 and pc(t["ph"]) < 50:
+        sug.append("Phone numbers are low: use Enrich websites on the Businesses page.")
+    if tot >= 20 and pc(t["em"]) < 25:
+        sug.append("Few emails found: run Enrich websites to scan business sites.")
+    if ov["now"]["wait"] and paused:
+        sug.append("The queue is paused with %d item(s) waiting: resume it on the Queue page." % ov["now"]["wait"])
+    elif ov["now"]["wait"] and not cont:
+        sug.append("Run continuously is off, so the queue only works 01:00 to 06:00: turn it on to work all day.")
+    if not ov["now"]["wait"] and not RUNNING:
+        sug.append("The queue is empty: add more places on the Queue page.")
+    if all(h["word"] != "Working" for h in helpers if h["name"] != "Local"):
+        sug.append("No cloud AI helper is working: check the keys or wait for the daily reset.")
+    if ov["now"]["failed"]:
+        sug.append("%d queue item(s) failed: open the Queue page to retry them." % ov["now"]["failed"])
+    ov["sug"] = sug[:3]
+    ov["worker"] = worker
+    return ov
+
 @app.route("/system")
 def system():
     day_rows, proj_rows, files, errors = claude_usage(14)
@@ -2302,10 +2849,60 @@ def system():
     e_row = c.execute("SELECT COUNT(*) n, COALESCE(SUM(examined),0) ex, COALESCE(SUM(updated),0) up, COALESCE(SUM(phones_added),0) pa, COALESCE(SUM(emails_added),0) ea FROM enrich_log WHERE ts>=?", (since,)).fetchone()
     c.close()
     return render_template_string(SYS, q_rows=q_rows, e_row=e_row, day_rows=day_rows, proj_rows=proj_rows, files=files, errors=errors, tot=tot,
-                                  g_rows=g_rows, g_models=g_models, g_err=g_err, g_tot=g_tot, model=MODEL, ai_rows=ai_rows, ai_share=ai_share)
+                                  g_rows=g_rows, g_models=g_models, g_err=g_err, g_tot=g_tot, model=MODEL, ai_rows=ai_rows, ai_share=ai_share, ov=sys_overview())
 
 SYS = HEAD + """
 <h2>System</h2>
+<style>
+.sy{max-width:1000px;margin:0 auto}.sy h3{margin:0 0 2px}.sy .help{color:var(--muted);font-size:13px;margin:0 0 10px}
+.sy .ban{padding:14px 18px;border-radius:12px;font-size:18px;font-weight:600;margin-bottom:14px;color:#fff}
+.sy .ban.green{background:#1f7a3d}.sy .ban.amber{background:#9a6a00}.sy .ban.red{background:#b5322a}
+.sy .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.sy .hc{border:1px solid var(--border);border-radius:12px;padding:12px}
+.sy .pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:12px;font-weight:600;}
+.sy .pill.green{background:var(--ok);color:#06210e}.sy .pill.amber{background:var(--warn);color:#1a1204}.sy .pill.red{background:var(--bad)}.sy .pill.grey{background:var(--surface2);color:var(--muted)}
+.sy .bar{height:8px;background:var(--surface2);border-radius:99px;overflow:hidden;margin:6px 0}.sy .bar i{display:block;height:100%;background:var(--accent)}
+.sy .big{font-size:26px;font-weight:700}.sy .row{display:flex;flex-wrap:wrap;gap:18px;margin-bottom:8px}.sy .row div{min-width:90px}
+.sy small{color:var(--muted)}.sy .sug{background:rgba(245,165,36,.08);border:1px solid rgba(245,165,36,.35)}.sy ul{margin:4px 0 0 18px;padding:0}
+.sy summary{cursor:pointer;font-weight:600}.sy .prob{padding:6px 0;border-bottom:1px solid var(--border)}
+</style>
+<div class='sy' id='sysroot'>
+{% set b = ov.banner %}
+<div class='ban {{b[0]}}'>{{b[1]}}</div>
+
+<div class='card'><h3>What is happening now</h3>
+<p class='help'>What the app is working on this minute, and what is lined up next.</p>
+<p style='font-size:17px'>{{ov.now.line}}</p>
+<p>Queue: <b>{{ov.now.done}}</b> done, <b>{{ov.now.wait}}</b> waiting{% if ov.now.failed %}, <b>{{ov.now.failed}}</b> failed{% endif %}.
+{% if ov.now.next %}Next up: <b>{{ov.now.next}}</b>.{% endif %}</p>
+<p>Run continuously is <b>{{'ON' if ov.now.cont else 'OFF'}}</b>{% if ov.now.paused %} &middot; queue is <b>paused</b>{% endif %}. Background worker: <b>{{'running' if ov.worker else 'stopped'}}</b>.</p></div>
+
+{% if ov.sug %}<div class='card sug'><h3>What to do</h3>
+<p class='help'>Short suggestions, shown only when something needs you.</p>
+<ul>{% for s in ov.sug %}<li>{{s}}</li>{% endfor %}</ul></div>{% endif %}
+
+<div class='card'><h3>Your AI helpers</h3>
+<p class='help'>AI helpers write and check text for the app. If one is busy or out of its free limit, the next one takes over automatically.</p>
+<div class='grid'>{% for h in ov.helpers %}<div class='hc'>
+<b>{{h.name}}</b> <span class='pill {{h.cls}}'>{{h.word}}</span>
+{% if h.lim %}<div class='bar'><i style='width:{{h.pct}}%'></i></div><small>{{h.n}} of about {{h.lim}} free requests used today</small>{% else %}<div class='bar'><i style='width:0'></i></div><small>No daily limit (runs on this PC)</small>{% endif %}
+<p style='margin:6px 0 0'>{{h.ok}} of {{h.n}} requests worked today<br>Speed: {{h.speed}}</p>
+<small>{{h.note}}</small></div>{% endfor %}</div></div>
+
+<div class='card'><h3>Your lead list</h3>
+<p class='help'>Every business the app has found so far, merged into one list.</p>
+<div class='row'><div><div class='big'>{{ov.leads.total}}</div><small>businesses</small></div>
+<div><div class='big'>{{ov.leads.td}}</div><small>added today</small></div>
+<div><div class='big'>{{ov.leads.wk}}</div><small>added this week</small></div></div>
+{% for lbl, n, pct in ov.leads.bars %}<div style='margin-top:6px'>{{lbl}}: <b>{{n}}</b> <small>({{pct}}%)</small><div class='bar'><i style='width:{{pct}}%'></i></div></div>{% endfor %}</div>
+
+<div class='card'><h3>Recent problems</h3>
+<p class='help'>The last 5 things that went wrong, in plain words. Most are fixed automatically.</p>
+{% for p in ov.probs %}<div class='prob'>{{p.ts}} &middot; {{p.text}}<details><summary><small>Show details</small></summary><small>{{p.raw}}</small></details></div>
+{% else %}<p>No problems recorded.</p>{% endfor %}</div>
+
+<details class='card' id='adv'><summary>Advanced</summary>
+<p class='help'>The full technical tables: usage logs, queue history and raw AI numbers.</p>
 <div class='card'><h3>Usage: Claude Code, last 14 days</h3>
 <p><small>Read from Claude Code's local session logs ({{files}} log file(s) scanned{% if errors %}, {{errors}} unreadable line(s) skipped{% endif %}). Only token counts are read, never message text. Days use this PC's local time. Cache write and cache read are prompt-cache tokens.</small></p>
 <table><tr><th>Day</th><th>Requests</th><th>Input</th><th>Output</th><th>Cache write</th><th>Cache read</th></tr>
@@ -2339,6 +2936,22 @@ SYS = HEAD + """
 {% if g_rows %}<tr><th>Total</th><th>{{g_tot.calls}}</th><th>{{g_tot.ok}}</th><th>{{g_tot.bad}}</th><th>{{'{:,}'.format(g_tot.pt)}}</th><th>{{'{:,}'.format(g_tot.ot)}}</th><th>{{'{:,}'.format(g_tot.tt)}}</th><th>{{'{:,}'.format(g_tot.tot)}}</th><th>{{g_tot.fb}}</th></tr>{% endif %}</table>
 {% if g_models %}<p style='margin-top:10px'><small>By model: {% for m in g_models %}{{m.model}}: {{m.n}} call(s), {{m.ok or 0}} ok{% if not loop.last %}; {% endif %}{% endfor %}</small></p>{% endif %}
 {% if g_err %}<p><small>Most recent failure: {{g_err.ts}} &middot; {{g_err.model}} &middot; {{g_err.error}}</small></p>{% endif %}</div>
+</details>
+</div>
+<script>
+setInterval(function(){
+  var y=window.scrollY;
+  var det=[].map.call(document.querySelectorAll('#sysroot details'),function(d){return d.open;});
+  fetch('/system',{cache:'no-store'}).then(function(r){return r.text();}).then(function(t){
+    var d=new DOMParser().parseFromString(t,'text/html'), n=d.getElementById('sysroot');
+    var cur=document.getElementById('sysroot');
+    if(!n||!cur)return;
+    cur.innerHTML=n.innerHTML;
+    [].forEach.call(cur.querySelectorAll('details'),function(e,i){e.open=!!det[i];});
+    window.scrollTo(0,y);
+  }).catch(function(){});
+},30000);
+</script>
 </main></body></html>"""
 
 # ---- Stage 1: master business list
@@ -2987,7 +3600,7 @@ def businesses_review_act(rid):
     return redirect("/businesses/review")
 
 BIZ = HEAD + """
-<div class='card'><form method='post' action='/businesses/enrich' style='float:right'><button class='grey' title='Scan websites of up to 40 businesses missing a phone or email (not enriched in 30 days)'>Enrich from websites</button></form>{% if request.args.get('enriching') %}<p style='color:#166534'>Enrichment started in the background; see the System page for counts.</p>{% endif %}<h2>Businesses <small>({{total}} match{% if review_n %} &middot; <a href='/businesses/review'>{{review_n}} to review</a>{% endif %})</small></h2>
+<div class='card'><form method='post' action='/businesses/enrich' style='float:right'><button class='grey' title='Scan websites of up to 40 businesses missing a phone or email (not enriched in 30 days)'>Enrich from websites</button></form><form method='post' action='/businesses/backfill' style='float:right;margin-right:8px'><button class='grey' title='Find phones/emails for businesses with no phone: own website, then web search. Only when no campaign is running; max 150 a day.'>Backfill phones</button></form>{% if request.args.get('bf') %}<p style='color:var(--ok)'>{{'A campaign is running; backfill only runs when none is.' if request.args.get('bf')=='busy' else 'Backfill started in the background.'}}</p>{% endif %}{% if request.args.get('enriching') %}<p style='color:var(--ok)'>Enrichment started in the background; see the System page for counts.</p>{% endif %}<h2>Businesses <small>({{total}} match{% if review_n %} &middot; <a href='/businesses/review'>{{review_n}} to review</a>{% endif %})</small></h2><p><small>{{bf_line}}</small></p>
 <form method='get' style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;align-items:center'>
 <input name='q' value='{{f.q}}' placeholder='Search name, address, phone, email, notes' style='margin:0;flex:2;min-width:200px'>
 {% for col, label in [('category','Category'),('state','State'),('city','City'),('status','Status')] %}
@@ -3023,7 +3636,7 @@ fetch('/api/business/'+id,{method:'POST',headers:{'Content-Type':'application/js
 REV = HEAD + """
 <div class='card'><h2>Review doubtful matches <small>({{items|length}})</small></h2>
 <p><small>A new find that looks like an existing business, but not certainly. Nothing is merged until you choose.</small></p>
-{% for it in items %}<div style='border-top:1px solid #e5e7eb;padding:10px 0'>
+{% for it in items %}<div style='border-top:1px solid var(--border);padding:10px 0'>
 <p><b>Why:</b> {{it.reason}}</p>
 <table><tr><th></th><th>Name</th><th>Address</th><th>Phones</th></tr>
 <tr><td>New find</td><td>{{it.new.name}}</td><td>{{it.new.locality}} {{it.new.address}}</td><td>{{it.newphones|join(', ')}}</td></tr>
@@ -3155,6 +3768,8 @@ def run_queue_item(qid, mode):
             c.commit()
             c.close()
             ex_, up, pa, ea = enrich_businesses(qid)
+            log(cid, "Enriched %d of %d" % (up, ex_))
+            print("Queue %s: Enriched %d of %d (phones +%d, emails +%d)" % (qid, up, ex_, pa, ea), flush=True)
             c = conn()
             c.execute("UPDATE queue SET status='done', enriched=? WHERE id=?", (up, qid))
             c.commit()
@@ -3164,6 +3779,16 @@ def run_queue_item(qid, mode):
             c.execute("UPDATE queue SET status='failed', note=? WHERE id=?", (str(ex)[:200], qid))
             c.commit()
             c.close()
+
+def auto_backfill():
+    # up to 25 leads, at most BUDGET_SECS, only when nothing is running; stops at once if a campaign starts
+    try:
+        if qset("paused", "0") == "1" or RUNNING:
+            return
+        import backfill
+        backfill.run(25, "auto", backfill.BUDGET_SECS)
+    except Exception as ex:
+        print("auto backfill error:", ex, flush=True)
 
 def queue_tick():
     # One worker check: only in the night window, one item at a time, at most NIGHT_CAP items a night.
@@ -3193,8 +3818,10 @@ def queue_tick():
             continue
         c.close()
         run_queue_item(q["id"], "auto")
+        auto_backfill()   # the gap before the next item
         return
     c.close()
+    auto_backfill()       # nothing to run now (cap reached, no pending item)
 
 def queue_worker():
     while True:
@@ -3202,7 +3829,13 @@ def queue_worker():
             queue_tick()
         except Exception as ex:
             print("queue worker error:", ex)
-        time.sleep(QUEUE_CHECK_SECS)
+        try:
+            import backfill
+            lag = backfill.LAST_SECS
+            backfill.LAST_SECS = 0
+        except Exception:
+            lag = 0
+        time.sleep(max(60, QUEUE_CHECK_SECS - lag))   # backfill time comes out of the wait, so the next item is not delayed
 
 def start_queue_worker():
     ensure_businesses()
@@ -3322,6 +3955,39 @@ QUEUE = HEAD + """
 
 import outreach
 outreach.register(sys.modules[__name__])
+import marketing.routes
+marketing.routes.register(sys.modules[__name__])
+import backfill
+backfill.register(sys.modules[__name__])
+
+# --- Stage timing: apply wrappers once every function exists ---
+for _n, _s in _STAGES.items():
+    if _n != "enrich_businesses":
+        globals()[_n] = _timed(globals()[_n], _s)
+
+_orig_run_campaign = run_campaign
+def run_campaign(cid):
+    _TL.cid = cid
+    _TL.stack = []
+    try:
+        return _orig_run_campaign(cid)
+    finally:
+        _TL.cid = None
+
+_orig_enrich = enrich_businesses
+def enrich_businesses(qid=None, *a, **k):
+    t = time.time()
+    try:
+        return _orig_enrich(qid, *a, **k)
+    finally:
+        try:
+            c = conn()
+            r = c.execute("SELECT campaign_id FROM queue WHERE id=?", (qid,)).fetchone() if qid else None
+            c.close()
+            if r and r["campaign_id"]:
+                log(r["campaign_id"], "Timing (website enrichment): " + str(int(round(time.time() - t))) + " s")
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     import sys

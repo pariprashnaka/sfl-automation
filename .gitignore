@@ -16,3 +16,7 @@ osm_cache.json
 *.bak*
 leads.db.bak*
 osm_cache.json
+
+# marketing uploads and outputs
+marketing/assets/*/
+!marketing/assets/icons/
