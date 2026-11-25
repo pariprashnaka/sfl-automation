@@ -213,5 +213,103 @@ class Stage3(unittest.TestCase):
             create.ai = old
 
 
+from marketing import queue as mq
+
+
+class Stage4(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = (mdb.ASSETS, mdb.OUT_ROOT)
+        mdb.ASSETS = pathlib.Path(self.tmp) / "assets"
+        mdb.OUT_ROOT = pathlib.Path(self.tmp) / "out"
+        self.m = make_app(self.tmp)
+        self.c = self.m.conn()
+        self.cl = self.m.app.test_client()
+
+    def tearDown(self):
+        mdb.ASSETS, mdb.OUT_ROOT = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def post(self, status="draft", images='["x.jpg"]'):
+        cur = self.c.execute("INSERT INTO posts(brand_id,product_id,type,topic,caption,status,image_paths,created_at) VALUES(1,1,'post','t','cap',?,?,?)",
+                             (status, images, mdb.now()))
+        self.c.commit()
+        return cur.lastrowid
+
+    def row(self, pid):
+        return self.c.execute("SELECT * FROM posts WHERE id=?", (pid,)).fetchone()
+
+    def test_approval_gate(self):
+        pid = self.post()
+        self.assertFalse(mq.can_publish(self.row(pid)))                      # draft cannot publish
+        ok, _ = mq.schedule(self.c, pid, "2030-01-01 10:00")
+        self.assertFalse(ok)                                                  # cannot schedule unapproved
+        self.assertEqual(self.row(pid)["status"], "draft")
+        self.assertTrue(mq.approve(self.c, pid)[0])
+        self.assertTrue(mq.can_publish(self.row(pid)))
+        r = self.cl.post("/marketing/post/%d/publish" % self.post())          # another draft via the HTTP route
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("Approve", r.headers["Location"])
+
+    def test_cannot_approve_without_image_or_twice(self):
+        self.assertFalse(mq.approve(self.c, self.post(images="[]"))[0])
+        pid = self.post()
+        mq.approve(self.c, pid)
+        self.assertFalse(mq.approve(self.c, pid)[0])
+
+    def test_schedule_validation_and_due(self):
+        pid = self.post()
+        mq.approve(self.c, pid)
+        self.assertFalse(mq.schedule(self.c, pid, "not a date")[0])
+        self.assertTrue(mq.schedule(self.c, pid, "2020-01-01T09:30")[0])
+        self.assertEqual(self.row(pid)["scheduled_at"], "2020-01-01 09:30:00")
+        self.assertEqual([r["id"] for r in mq.due_posts(self.c)], [pid])
+        mq.schedule(self.c, pid, "2999-01-01T09:30")
+        self.assertEqual(mq.due_posts(self.c), [])
+        mq.unschedule(self.c, pid)
+        self.assertEqual(self.row(pid)["status"], "approved")
+
+    def test_unapproved_scheduled_row_is_never_due(self):
+        pid = self.post(status="scheduled")
+        self.c.execute("UPDATE posts SET scheduled_at='2020-01-01 00:00:00' WHERE id=?", (pid,))
+        self.c.commit()
+        self.assertEqual(mq.due_posts(self.c), [])                            # no approved_at -> not due
+
+    def test_edit_resets_approval_and_delete(self):
+        pid = self.post()
+        mq.approve(self.c, pid)
+        mq.edit_text(self.c, pid, "new", "#a", "alt")
+        r = self.row(pid)
+        self.assertEqual((r["status"], r["approved_at"]), ("draft", ""))
+        self.assertTrue(mq.delete(self.c, pid)[0])
+        self.assertFalse(mq.delete(self.c, self.post(status="publishing"))[0])
+
+    def test_queue_page_and_filters(self):
+        self.post()
+        self.post(status="failed")
+        self.c.execute("UPDATE posts SET error='Instagram rejected it' WHERE status='failed'")
+        self.c.commit()
+        for u in ("/marketing/queue", "/marketing/queue?status=failed", "/marketing/queue?status=draft"):
+            self.assertEqual(self.cl.get(u).status_code, 200)
+        html = self.cl.get("/marketing/queue?status=failed").get_data(as_text=True)
+        self.assertIn("Retry", html)
+        self.assertIn("Instagram rejected it", html)
+
+    def test_scheduler_tick_is_rate_limited(self):
+        calls = []
+        old = mq.publish_post
+        mq.publish_post = lambda pid: calls.append(pid) or (True, "")
+        try:
+            pid = self.post()
+            mq.approve(self.c, pid)
+            mq.schedule(self.c, pid, "2020-01-01T09:30")
+            mq._last_tick[0] = 0
+            self.assertEqual(mq.scheduler_tick(), 1)
+            self.assertEqual(mq.scheduler_tick(), 0)                          # second call inside 10 minutes does nothing
+            self.assertEqual(calls, [pid])
+        finally:
+            mq.publish_post = old
+
+
 if __name__ == "__main__":
     unittest.main()

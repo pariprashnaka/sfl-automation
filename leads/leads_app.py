@@ -3830,6 +3830,11 @@ def queue_worker():
         except Exception as ex:
             print("queue worker error:", ex)
         try:
+            import marketing.queue as _mkq
+            _mkq.scheduler_tick()          # publishes due, approved, scheduled posts (self-limited to once per 10 minutes)
+        except Exception as ex:
+            print("marketing scheduler error:", ex)
+        try:
             import backfill
             lag = backfill.LAST_SECS
             backfill.LAST_SECS = 0
