@@ -130,6 +130,7 @@ def hexcol(v, default):
 
 @bp.route("/marketing/brands")
 def brands_page():
+    from . import shots
     c = db()
     brands = c.execute("SELECT * FROM brands ORDER BY id").fetchall()
     prods = c.execute("SELECT * FROM products ORDER BY id").fetchall()
@@ -151,9 +152,10 @@ def brands_page():
                    "<label>Key points (one per line)</label><textarea name='key_points' rows='3'>%s</textarea>"
                    "<label>Price note</label><input name='price_note' value='%s'>"
                    "<label>Product photo (optional, picked up automatically)</label><input type='file' name='photo' accept='image/*'>"
-                   "<div style='margin-top:10px'><button>Save product</button> <button class='grey' name='delete' value='1' formnovalidate>Delete</button></div></form></details>") % (
+                   "<div style='margin-top:10px'><button>Save product</button> <button class='grey' name='delete' value='1' formnovalidate>Delete</button></div></form>"
+                   "<h4 style='margin:14px 0 4px'>Screenshots</h4><div class='note'>Demo data only. Each needs a one-line note; they are used in screenshot slides.</div>%s</details>") % (
                 esc(p["name"]), "photo uploaded" if ph else "no photo - text-only templates", p["id"], esc(p["name"]), esc(p["description"]),
-                esc(p["key_points"]), esc(p["price_note"]))
+                esc(p["key_points"]), esc(p["price_note"]), shots.widget(p["id"]))
         cast = ""
         for m in cm.get(b["id"], []):
             cast += ("<div class='card' style='margin:8px 0'><b>%s</b> <span class='note'>(%s)</span><div class='row'><div><label>Name</label><input name='name_%s' value='%s'></div>"
@@ -180,7 +182,7 @@ def brands_page():
             esc(b["footer_left"]), esc(b["footer_right"]), esc(b["notes"]), cast, pr, b["id"]))
     out.append("<div class='card'><h3>New brand</h3><form method='post' action='/marketing/brand/0'><div class='row'><div><input name='name' placeholder='Brand name'></div>"
                "<div style='flex:0'><button>Add brand</button></div></div></form></div>")
-    return page("/marketing/brands", "".join(out), "Brand kit")
+    return page("/marketing/brands", shots.STYLE + "".join(out) + shots.js(), "Brand kit")
 
 
 @bp.route("/marketing/cast/<int:bid>", methods=["POST"])
@@ -299,5 +301,5 @@ def register(mod):
     c = mod.conn()
     mdb.ensure(c)
     c.close()
-    from . import create, queue, story_routes        # noqa: F401  (adds their routes to the blueprint)
+    from . import create, queue, story_routes, shots        # noqa: F401  (adds their routes to the blueprint)
     mod.app.register_blueprint(bp)

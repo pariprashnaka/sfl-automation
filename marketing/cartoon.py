@@ -4,7 +4,7 @@ the story, dialogue and claims all come from the script (written by the AI from 
 No known or copied characters: every shape below is drawn from simple primitives.
 """
 import json, re, pathlib
-from . import images, imagegen
+from . import images, imagegen, shotslides, zones
 
 SCENES = {"shop_counter": "Shop counter", "shelves": "Shelves behind a counter", "shop_front": "Shop front", "plain": "Plain background"}
 ROLES = {"shopkeeper": "Shopkeeper", "shopkeeper2": "Second shopkeeper", "customer": "Customer"}
@@ -15,7 +15,7 @@ PROPS = {"tablet": "Tablet", "phone": "Phone", "notebook": "Notebook", "boxes": 
 SURFACE = ("tablet", "phone", "notebook", "boxes", "calendar", "receipt", "bag", "coin")      # sit on the counter
 FLOAT = ("lightbulb", "clock", "question", "tick", "cross")                                    # float above the scene
 LANGS = {"Hindi": "Hindi in Devanagari script", "English": "English", "Hinglish": "Hinglish (Hindi written in Roman letters)"}
-MIN_SLIDES, MAX_SLIDES = 3, 8
+MIN_SLIDES, MAX_SLIDES = 3, 10
 DEVANAGARI = re.compile(r'[ऀ-ॿ]')
 PROVIDER_SET = ("cloudflare", "gemini", "svg")
 CLAIM_WORDS = re.compile(r"guarantee|100\s?%|\bbest\b|no\.?\s?1\b|#1|\bfree\b|lifetime|never fail|zero loss|\bonly\b", re.I)
@@ -183,7 +183,8 @@ def scene_svg(slide):
 def blank_slide():
     return {"scene": "shop_counter", "description": "", "characters": [{"role": "shopkeeper", "expression": "neutral", "position": "left"}],
             "props": [], "dialogue": [{"speaker": "shopkeeper", "text": ""}], "narration": "", "claim_note": "", "is_cta": False,
-            "image": "", "provider": "", "img_v": 0, "img_note": ""}
+            "image": "", "provider": "", "img_v": 0, "img_note": "",
+            "type": "scene", "shots": [], "layout": "single", "device": "tablet", "bg": "gradient"}
 
 
 def clean_slide(s):
@@ -212,11 +213,17 @@ def clean_slide(s):
             if t:
                 dlg.append({"speaker": d.get("speaker") if d.get("speaker") in roles else roles[0], "text": t})
     props = [p for p in (s.get("props") or []) if p in PROPS][:4]
-    return {"scene": s.get("scene") if s.get("scene") in SCENES else "shop_counter", "description": imagegen.scrub(s.get("description")),
+    typ = s.get("type") if s.get("type") in shotslides.TYPES else "scene"
+    if typ == "shot":
+        dlg = []                                           # screenshot slides carry a caption (narration), no speech bubbles
+    elif typ == "device":
+        dlg = dlg[:1]
+    extra = shotslides.slide_fields(s, typ)
+    return dict(extra, **{"scene": s.get("scene") if s.get("scene") in SCENES else "shop_counter", "description": imagegen.scrub(s.get("description")),
             "characters": chars, "props": props, "dialogue": dlg, "narration": imagegen.scrub(s.get("narration")),
             "claim_note": str(s.get("unsupported_claim") or s.get("claim_note") or "").strip(), "is_cta": bool(s.get("is_cta")),
             "image": imagegen.safe_name(s.get("image")) or "", "provider": s.get("provider") if s.get("provider") in PROVIDER_SET else "",
-            "img_v": int(s.get("img_v") or 0) % 100 if str(s.get("img_v") or "0").isdigit() else 0, "img_note": str(s.get("img_note") or "")[:300]}
+            "img_v": int(s.get("img_v") or 0) % 100 if str(s.get("img_v") or "0").isdigit() else 0, "img_note": str(s.get("img_note") or "")[:300]})
 
 
 def claim_flags(slide, facts):
@@ -230,6 +237,12 @@ def claim_flags(slide, facts):
     if nums or words:
         return "claim not in product details - confirm before posting"
     return ""
+
+
+def slide_facts(slide, facts, notes):
+    """Facts a slide may state: the product record plus the notes of the screenshots on that slide."""
+    extra = shotslides.slide_notes(slide, notes or {})
+    return (facts or "") + ("\n" + extra if extra else "")
 
 
 def product_facts(product):
@@ -265,17 +278,30 @@ def ensure_cta(slides, cta):
     return True
 
 
-def clean_script(d, n, facts, lang="", cta=""):
+def drop_cta_text(slides, cta):
+    """The call to action is shown once, as the button of the CTA slide: remove it from that slide's bubbles and caption."""
+    c = (cta or "").strip().casefold()
+    if not c:
+        return
+    for s in slides:
+        if s.get("is_cta"):
+            s["dialogue"] = [d for d in s["dialogue"] if c not in d["text"].casefold()]
+            if c in s["narration"].casefold():
+                s["narration"] = ""
+
+
+def clean_script(d, n, facts, lang="", cta="", notes=None):
     d = d if isinstance(d, dict) else {}
     slides = [clean_slide(s) for s in (d.get("slides") or [])][:MAX_SLIDES]
     if not slides:
         raise ValueError("The AI returned no slides.")
     for s in slides:
-        note = claim_flags(s, facts)
+        note = claim_flags(s, slide_facts(s, facts, notes))
         s["claim_note"] = "claim not in product details - confirm before posting" if note else ""
         if lang == "Hindi" and s["dialogue"] and not any(DEVANAGARI.search(x["text"]) for x in s["dialogue"]):
             s["claim_note"] = s["claim_note"] or "dialogue is not in Devanagari - edit it or Regenerate slide"
     ensure_cta(slides, cta)
+    drop_cta_text(slides, cta)
     return {"title": str(d.get("title") or "").strip(), "caption": str(d.get("caption") or "").strip(), "alt": str(d.get("alt") or "").strip(),
             "hashtags_raw": d.get("hashtags") or [], "slides": slides, "language": lang}
 
@@ -321,47 +347,18 @@ def slide_prompt(script, index, brief, product, language, tone, instruction=""):
 
 
 # ---------------- slide HTML + render ----------------
-CSS = """<style>
-body{font-family:'Seg','Segoe UI','Nirmala UI',sans-serif}
-.cart{flex:1;min-height:0;display:flex;flex-direction:column;gap:20px}
-.scn{position:relative;flex:1;min-height:0;max-height:878px;border-radius:36px;overflow:hidden;background:#1a1a1d}
-.scn img.ill{width:100%;height:100%;object-fit:cover;display:block}
-.scn .svgw{position:absolute;inset:0}
-.bbs{position:absolute;left:24px;right:24px;top:22px;display:flex;flex-direction:column;gap:34px;z-index:3}
-.bw{position:relative;width:100%}
-.bb{background:#fff;color:#111;border-radius:34px;padding:20px 28px;font-size:42px;line-height:1.28;max-width:78%;min-width:44%;width:fit-content;overflow:hidden;font-weight:700;box-shadow:0 6px 22px rgba(0,0,0,.35)}
-.bw.l .bb{margin-right:auto}.bw.r .bb{margin-left:auto}.bw.c .bb{margin:0 auto;min-width:0}
-.tail{position:absolute;bottom:-26px;width:0;height:0;border-left:18px solid transparent;border-right:18px solid transparent;border-top:30px solid #fff;transform:translateX(-50%);filter:drop-shadow(0 6px 4px rgba(0,0,0,.25))}
-.nar{font-size:36px;line-height:1.3;color:__MU__;flex:none;overflow:hidden}
-.cta.cbig{align-self:center;font-size:48px;padding:28px 60px;text-align:center}
-</style>"""
-
-TAILX = {"left": 27, "right": 73, "center": 50}
-
-
-def slide_html(spec, script, i):
-    s = script["slides"][i]
-    n = len(script["slides"])
-    pos = {c["role"]: c["position"] for c in s["characters"]}
-    bw = []
-    for d in s["dialogue"]:
-        p = pos.get(d["speaker"], "center")
-        bw.append("<div class='bw %s'><div class='bb' data-fit style='max-height:170px'>%s</div><i class='tail' style='left:%d%%'></i></div>" % (
-            {"left": "l", "right": "r"}.get(p, "c"), images.e(d["text"]), TAILX.get(p, 50)))
-    f = s.get("_file")
-    pic = ("<img class='ill' src='%s'>" % images.uri(f)) if f else "<div class='svgw'>%s</div>" % scene_svg(s)
-    nar = "<div class='nar' data-fit style='max-height:110px'>%s</div>" % images.e(s["narration"]) if s["narration"] else ""
-    cta = images.cta_html(spec).replace("class='cta'", "class='cta cbig'") if i == n - 1 else ""
-    body = "%s<div class='cart'><div class='scn'>%s<div class='bbs'>%s</div></div></div>%s%s" % (CSS.replace("__MU__", "#b4b4bc"), pic, "".join(bw), nar, cta)
-    return images.frame(spec, body, tag="%d / %d" % (i + 1, n), deco=False)
+def slide_html(spec, script, i, ctx):
+    """Inner HTML of slide i: header, picture zone, text zone, footer (see zones.py). ctx: lookup, out_dir, names, ill, bg."""
+    return zones.build(spec, script["slides"][i], i, len(script["slides"]), dict(ctx, scene_svg=scene_svg))
 
 
 def slide_prompt_for(slide, cast):
     return imagegen.scene_prompt(slide, cast, SCENES)
 
 
-def render_script(script, brand, product, out_dir, cta="", progress=None, get_image=None):
-    """Render the script exactly as written to slide_N.jpg files (1080x1350). One slide at a time, browser closed after each."""
+def render_script(script, brand, product, out_dir, cta="", progress=None, get_image=None, lookup=None, names=None):
+    """Render the script exactly as written to slide_N.jpg files (1080x1350). Slide types can be mixed. One slide at a time, browser closed after each.
+    After layout, the boxes are checked: any text over the picture, or text that does not fit, fails the render with a clear message."""
     msg = images.ram_message()
     if msg:
         raise images.RenderError(msg)
@@ -369,7 +366,7 @@ def render_script(script, brand, product, out_dir, cta="", progress=None, get_im
     w, h = spec["size"]
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("*.jpg"):
+    for old in list(out_dir.glob("*.jpg")) + list(out_dir.glob("_*.png")):
         old.unlink()
     n = len(script["slides"])
     files = []
@@ -377,9 +374,14 @@ def render_script(script, brand, product, out_dir, cta="", progress=None, get_im
     for i in range(n):
         if progress:
             progress("drawing slide %d of %d" % (i + 1, n))
-        script["slides"][i]["_file"] = get_image(i) if get_image else None
+        s = script["slides"][i]
+        f = get_image(i) if get_image else None
+        if s["type"] == "shot" and not any((lookup or (lambda k: None))(x["id"]) for x in s["shots"]):
+            raise images.RenderError("Slide %d has no screenshot (it was deleted or not chosen)." % (i + 1))
+        ctx = {"lookup": lookup or (lambda k: None), "out_dir": out_dir, "names": names or {}, "ill": f if s["type"] == "scene" else "",
+               "bg": f if s["type"] == "device" else ""}
         hp = out_dir / ("_c%d.html" % i)
-        hp.write_text(images.page_html(spec, slide_html(spec, script, i), w, h), encoding="utf-8")
+        hp.write_text(images.page_html(spec, slide_html(spec, script, i, ctx), w, h), encoding="utf-8")
         path = out_dir / ("slide_%d.jpg" % (i + 1))
         with images.LOCK:
             with sync_playwright() as p:
@@ -388,12 +390,18 @@ def render_script(script, brand, product, out_dir, cta="", progress=None, get_im
                     pg = br.new_page(viewport={"width": w, "height": h})
                     pg.goto(images.uri(hp))
                     pg.wait_for_selector("body[data-ready='1']", timeout=30000)
+                    rep = pg.evaluate(zones.FIT_JS)
                     png = pg.screenshot(type="png")
                 finally:
                     br.close()
         hp.unlink()
+        errs = zones.check_layout(rep)
+        if errs:
+            raise images.RenderError("Slide %d: %s. Shorten the text or change the slide, then Render again." % (i + 1, "; ".join(errs)))
         images._save_jpeg_from_png(png, str(path))
         if not path.exists() or path.stat().st_size < 2000:
             raise images.RenderError("Slide %d came out empty." % (i + 1))
         files.append(str(path))
+    for q in out_dir.glob("_*.png"):
+        q.unlink()
     return files

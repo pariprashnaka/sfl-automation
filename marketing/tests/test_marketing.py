@@ -838,5 +838,298 @@ class ImageGen(unittest.TestCase):
         self.assertEqual(len(s2["slides"]), 3)
 
 
+class Screenshots(unittest.TestCase):
+    """Library upload rules, layout selection, caption claims, mocked AI insertion, zone layout check."""
+
+    def setUp(self):
+        from marketing import shots, shotslides, zones, story_routes as sr
+        self.shots, self.ss, self.zones, self.sr = shots, shotslides, zones, sr
+        self.tmp = tempfile.mkdtemp()
+        self.old = (mdb.ASSETS, mdb.OUT_ROOT, sr.ai)
+        mdb.ASSETS = pathlib.Path(self.tmp) / "assets"
+        mdb.OUT_ROOT = pathlib.Path(self.tmp) / "out"
+        self.m = make_app(self.tmp)
+        self.cl = self.m.app.test_client()
+        c = self.m.conn()
+        mdb.ensure(c)
+        self.b = c.execute("SELECT * FROM brands WHERE name='SFL'").fetchone()
+        self.p = c.execute("SELECT * FROM products WHERE brand_id=?", (self.b["id"],)).fetchone()
+        c.close()
+
+    def tearDown(self):
+        mdb.ASSETS, mdb.OUT_ROOT, self.sr.ai = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def png(self, w=300, h=200, fmt="PNG"):
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), (30, 90, 200)).save(buf, fmt)
+        return buf.getvalue()
+
+    def upload(self, files, notes, confirm=True):
+        data = {"shot": [(io.BytesIO(b), n) for n, b in files]}
+        for k, note in enumerate(notes):
+            data["note_%d" % k] = note
+            data["title_%d" % k] = "T%d" % k
+        if confirm:
+            data["confirm"] = "1"
+        return self.cl.post("/api/marketing/shots/%d" % self.p["id"], data=data, content_type="multipart/form-data").get_json()
+
+    def count(self):
+        c = self.m.conn()
+        try:
+            return c.execute("SELECT COUNT(*) FROM screenshots").fetchone()[0]
+        finally:
+            c.close()
+
+    # ---- Job A ----
+    def test_upload_requires_confirmation_note_and_valid_image(self):
+        r = self.upload([("a.png", self.png())], ["Stock list"], confirm=False)
+        self.assertFalse(r["ok"])
+        self.assertIn("I confirm no real customer data", r["error"])
+        self.assertFalse(self.upload([("a.png", self.png())], ["   "])["ok"])                        # note is required
+        self.assertFalse(self.upload([("a.exe", self.png())], ["x"])["ok"])                          # wrong type
+        self.assertFalse(self.upload([("a.png", b"not an image")], ["x"])["ok"])                     # not an image
+        self.assertEqual(self.count(), 0)
+        r = self.upload([("a.png", self.png()), ("b.png", self.png())], ["ok", ""])                  # one bad row: nothing saved
+        self.assertFalse(r["ok"])
+        self.assertEqual(self.count(), 0)
+        self.assertIn("customer", self.shots.WARNING)
+
+    def test_upload_saves_downscales_and_lists(self):
+        r = self.upload([("big.png", self.png(3000, 1000)), ("p.jpg", self.png(400, 800, "JPEG")), ("w.webp", self.png(200, 100, "WEBP"))], ["Stock list", "Phone view", "Small"])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(self.count(), 3)
+        c = self.m.conn()
+        rows = c.execute("SELECT * FROM screenshots ORDER BY id").fetchall()
+        c.close()
+        self.assertEqual(rows[0]["width"], 2400)                                                     # max 2400 px wide
+        self.assertEqual(rows[1]["width"], 400)                                                      # never upscaled
+        for row in rows:
+            f = mdb.ASSETS / row["path"]
+            self.assertTrue(f.is_file())
+            self.assertIn("/screenshots/", f.as_posix())
+            self.assertLessEqual(Image.open(f).width, 2400)
+        lst = self.cl.get("/api/marketing/shots?product_id=%d" % self.p["id"]).get_json()
+        self.assertEqual([s["note"] for s in lst["shots"]], ["Small", "Phone view", "Stock list"])
+        self.assertEqual(self.cl.get(lst["shots"][0]["url"]).status_code, 200)
+        self.assertEqual(self.cl.post("/api/marketing/shots/delete/%d" % rows[0]["id"]).get_json()["ok"], True)
+        self.assertEqual(self.count(), 2)
+
+    def test_brand_kit_and_create_pages_have_library_ui(self):
+        h = self.cl.get("/marketing/brands").get_data(as_text=True)
+        self.assertIn("shotbox", h)
+        self.assertIn("I confirm no real customer data", h)
+        self.assertIn("Use demo data only", h)
+        h = self.cl.get("/marketing/create").get_data(as_text=True)
+        for needle in ("Add screenshots to story", "Screenshot library", "Start screenshot slides", "Regenerate caption", "Screenshot on device", "Upload new..."):
+            self.assertIn(needle, h)
+
+    # ---- Job B ----
+    def test_layout_selection(self):
+        ss = self.ss
+        self.assertEqual([ss.pick_layout(n) for n in (1, 2, 3, 4)], ["single", "2up", "stack", "grid"])
+        self.assertEqual(ss.pick_layout(2, [1.8, 1.7]), "stack")                                      # two wide screenshots stack
+        self.assertEqual(ss.pick_layout(2, [0.5, 0.6]), "2up")
+        self.assertEqual(ss.valid_layout("grid", 1), "single")                                        # grid needs 2-4
+        self.assertEqual(ss.valid_layout("single", 3), "stack")
+        self.assertEqual(ss.valid_layout("2up", 2), "2up")
+        self.assertEqual([ss.pick_device(a) for a in (0.5, 1.2, 1.5, 1.9, None)], ["phone", "tablet", "laptop", "tv", "tablet"])
+        for lay, n in (("single", 1), ("2up", 2), ("stack", 3), ("grid", 4)):
+            sl = self.zones.slots(lay, n)
+            self.assertEqual(len(sl), n)
+            for x, y, w, h in sl:
+                self.assertTrue(0 <= x and 0 <= y and x + w <= self.zones.PIC[2] and y + h <= self.zones.PIC[3])
+        s = cartoon.clean_slide({"type": "shot", "shots": [{"id": i} for i in (1, 2, 3, 4, 5, 6)], "layout": "single"})
+        self.assertEqual((len(s["shots"]), s["layout"]), (4, "grid"))
+        d = cartoon.clean_slide({"type": "device", "shots": [{"id": 1}, {"id": 2}], "device": "crt"})
+        self.assertEqual((len(d["shots"]), d["device"]), (1, "tablet"))
+        self.assertIsNone(self.ss.clean_hl({"x": 0.5, "y": 0.5, "w": 0.001, "h": 0.4}))
+        self.assertEqual(self.ss.clean_hl({"x": 0.8, "y": 0.1, "w": 0.5, "h": 0.2, "arrow": 1})["w"], 0.2)   # clipped to the image
+
+    def test_caption_claims_only_from_product_or_screenshot_note(self):
+        facts = "InventoryCloud\nStock in one place"
+        notes = {7: "Stock list with low stock marked in red"}
+        ok = cartoon.clean_slide({"type": "shot", "shots": [{"id": 7}], "narration": "Low stock marked in red"})
+        self.assertEqual(cartoon.claim_flags(ok, cartoon.slide_facts(ok, facts, notes)), "")
+        bad = cartoon.clean_slide({"type": "shot", "shots": [{"id": 7}], "narration": "Save 40% and get a free guarantee"})
+        self.assertIn("confirm before posting", cartoon.claim_flags(bad, cartoon.slide_facts(bad, facts, notes)))
+        num = cartoon.clean_slide({"type": "shot", "shots": [{"id": 7}], "narration": "Track 500 items"})
+        self.assertTrue(cartoon.claim_flags(num, cartoon.slide_facts(num, facts, notes)))
+        self.assertEqual(cartoon.claim_flags(num, cartoon.slide_facts(num, facts + "\n500 items", notes)), "")
+
+    def make_shots(self, n=3):
+        c = self.m.conn()
+        try:
+            got = {}
+            for k in range(n):
+                p = self.shots.save_image(Image.new("RGB", (800, 500 + 100 * k), (10, 90, 200)), "PNG", mdb.ASSETS / "sfl" / "screenshots", "t%d" % k)
+                cur = c.execute("INSERT INTO screenshots(brand_id,product_id,path,title,note,width,height) VALUES(?,?,?,?,?,800,500)",
+                                (self.b["id"], self.p["id"], p.relative_to(mdb.ASSETS).as_posix(), "S%d" % k, "Stock list shows low stock %d" % k))
+                got[cur.lastrowid] = {"path": p, "title": "S%d" % k, "note": "Stock list shows low stock %d" % k, "w": 800, "h": 500}
+            c.commit()
+            return got
+        finally:
+            c.close()
+
+    def test_mocked_ai_insertion_places_validates_and_keeps_cta_last(self):
+        got = self.make_shots(3)
+        ids = list(got)
+        story = [cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}], "dialogue": [{"speaker": "shopkeeper", "text": "t%d" % k}]}) for k in range(3)]
+        story.append(cartoon.clean_slide({"is_cta": True}))
+        ai_answer = {"inserts": [
+            {"after": 2, "type": "shot", "shot_ids": [ids[0], 9999], "layout": "grid", "caption": "Stock list shows low stock 0"},
+            {"after": 1, "type": "device", "shot_ids": [ids[1]], "device": "hologram", "caption": "Save 90% with a guarantee"},
+            {"after": 3, "type": "shot", "shot_ids": [ids[1]], "caption": "reused id is dropped"},                 # ids[1] already used
+            {"after": 99, "type": "shot", "shot_ids": [ids[2]], "layout": "single", "caption": ""}]}
+        out = self.sr.apply_inserts(story, ai_answer, got, "InventoryCloud", "Call us")
+        self.assertEqual(len(out), 4 + 3)
+        self.assertTrue(out[-1]["is_cta"])                                                                      # CTA slide stays last
+        dev = next(s for s in out if s["type"] == "device")
+        self.assertEqual(len(dev["shots"]), 1)
+        self.assertIn(dev["device"], self.ss.DEVICES)
+        self.assertIn("confirm before posting", dev["claim_note"])                                              # unsupported caption flagged
+        first = next(s for s in out if s["type"] == "shot")
+        self.assertEqual((first["layout"], len(first["shots"])), ("single", 1))                                 # unknown id dropped, grid invalid for 1
+        self.assertEqual(first["claim_note"], "")
+        order = [s["type"] for s in out]
+        self.assertEqual(order.index("device"), 1)                                                              # right after story slide 1
+        self.assertLess(order.index("device"), order.index("shot"))
+        last_shot = [s for s in out if s["type"] == "shot"][-1]
+        self.assertEqual(last_shot["shots"][0]["id"], ids[2])                                                    # after=99 clamps before the CTA slide
+        self.assertEqual(out.index(last_shot), len(out) - 2)
+
+    def test_addshots_endpoint_with_mocked_ai(self):
+        got = self.make_shots(2)
+        ids = list(got)
+        sr = self.sr
+        sr.TOKENS["tk"] = _time.time()
+        story = [cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": "t%d" % k}]}) for k in range(3)]
+        seen = {}
+
+        def fake_ai(task, prompt, **k):
+            seen["task"], seen["big"], seen["prompt"] = task, k.get("big"), prompt
+            return json.dumps({"inserts": [{"after": 1, "type": "shot", "shot_ids": ids, "layout": "2up", "caption": "Stock list shows low stock 0"}]})
+        sr.ai = fake_ai
+        r = self.cl.post("/api/marketing/story/addshots", json={"brand_id": self.b["id"], "product_id": self.p["id"], "shot_ids": ids,
+                                                                "script": {"token": "tk", "slides": story, "language": "Hindi"}}).get_json()
+        self.assertTrue(r["ok"], r)
+        for _ in range(100):
+            j = sr.JOBS[r["job"]]
+            if j["state"] != "running":
+                break
+            _time.sleep(0.1)
+        self.assertEqual(j["state"], "done", j["error"])
+        self.assertEqual((seen["task"], seen["big"]), ("marketing_caption", True))
+        self.assertIn("Stock list shows low stock 0", seen["prompt"])
+        sl = j["result"]["slides"]
+        self.assertEqual([s["type"] for s in sl], ["scene", "shot", "scene", "scene"])
+        self.assertEqual(sl[1]["layout"], "2up")
+        r = self.cl.post("/api/marketing/story/addshots", json={"brand_id": self.b["id"], "shot_ids": [], "script": {"token": "tk", "slides": story}}).get_json()
+        self.assertFalse(r["ok"])
+        sr.ai = lambda *a, **k: "no json at all"
+        r = self.cl.post("/api/marketing/story/addshots", json={"brand_id": self.b["id"], "product_id": self.p["id"], "shot_ids": ids, "script": {"token": "tk", "slides": story}}).get_json()
+        for _ in range(100):
+            j = sr.JOBS[r["job"]]
+            if j["state"] != "running":
+                break
+            _time.sleep(0.1)
+        self.assertEqual(j["state"], "error")
+
+    # ---- Job C / D ----
+    def test_flux_prompts_say_blank_signs_and_no_text(self):
+        from marketing import imagegen
+        cast = [dict(role=r, name=n, description=d, seed=sd) for r, n, d, sd in imagegen.DEFAULT_CAST]
+        prompt, _ = imagegen.scene_prompt(cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}]}), cast, cartoon.SCENES)
+        for text in (prompt, imagegen.empty_bg_prompt("shop"), imagegen.empty_bg_prompt("office")):
+            for w in ("blank signboards", "no signs", "no readable text", "no letters", "no logos"):
+                self.assertIn(w, text)
+        for w in ("no people", "no devices", "no screens"):
+            self.assertIn(w, imagegen.empty_bg_prompt())
+
+    def spec(self):
+        return images.build_spec("carousel", "highlight", dict(self.b), self.p, "t", cta="Call 99999 now")
+
+    def ctx(self, **k):
+        return dict({"lookup": lambda i: None, "out_dir": pathlib.Path(self.tmp), "names": {"shopkeeper": "Ramesh"}, "ill": "", "scene_svg": cartoon.scene_svg}, **k)
+
+    def test_cta_shown_once_as_button(self):
+        sp = self.spec()
+        sl = cartoon.clean_slide({"is_cta": True, "dialogue": [{"speaker": "shopkeeper", "text": "Call 99999 now"}, {"speaker": "shopkeeper", "text": "Aaiye"}],
+                                  "narration": "Call 99999 now"})
+        html = self.zones.build(sp, sl, 4, 5, self.ctx())
+        self.assertEqual(html.count("Call 99999 now"), 1)
+        self.assertIn("class='cta'", html)
+        self.assertIn("Aaiye", html)                                                                            # other lines stay
+        s2 = cartoon.clean_script({"slides": [{"dialogue": [{"speaker": "shopkeeper", "text": "Call 99999 now"}]}] * 3}, 3, "", "Hindi", "Call 99999 now")
+        self.assertTrue(s2["slides"][-1]["is_cta"])
+        self.assertNotIn("Call 99999 now", json.dumps(s2["slides"][-1]["dialogue"]))
+
+    def test_zones_never_overlap_by_construction(self):
+        z = self.zones
+        pic_bottom = z.PIC[1] + z.PIC[3]
+        self.assertGreater(z.TXT[1], pic_bottom)                                                                # text zone starts below the picture
+        self.assertGreater(z.TXT[1] + z.TXT[3], z.TXT[1])
+        self.assertLessEqual(z.TXT[1] + z.TXT[3], z.FOOT[1])                                                    # footer strip is its own band
+        self.assertLessEqual(z.HEAD[1] + z.HEAD[3], z.PIC[1])
+        self.assertTrue(0.5 <= z.PIC[3] / z.H <= 0.55)
+        self.assertLess(z.TXT[1] + z.TAIL, z.TXT[1] + z.TXT[3])
+        for nb, cap, cta in ((0, False, True), (1, True, False), (2, False, False), (2, True, True)):
+            b = z.budgets(nb, cap, cta)
+            used = b["cta"] + (14 if cta else 0) + b["cap"] + (z.TAIL + b["bub"] * nb + 14 * (nb - 1) if nb else 0) + (14 if nb and cap else 0)
+            self.assertLessEqual(used, z.TXT[3])
+
+    def test_check_layout_detects_overlap_and_overflow(self):
+        z = self.zones
+        box = lambda x, y, r, b: {"x": x, "y": y, "r": r, "b": b}
+        pic = box(60, 130, 1020, 830)
+        clean = {"pic": pic, "texts": [{"kind": "bubble", "box": box(60, 878, 600, 1000)}, {"kind": "tail", "box": box(200, 856, 228, 878)},
+                                       {"kind": "footer", "box": box(60, 1250, 1020, 1314)}], "over": [], "zoneFull": False}
+        self.assertEqual(z.check_layout(clean), [])
+        for kind, bad in (("bubble", box(60, 800, 600, 900)), ("tail", box(200, 820, 228, 870)), ("cta", box(100, 700, 900, 820)), ("header", box(60, 100, 1020, 140))):
+            rep = dict(clean, texts=clean["texts"] + [{"kind": kind, "box": bad}])
+            errs = z.check_layout(rep)
+            self.assertTrue(any("overlaps the picture" in e and kind in e for e in errs), (kind, errs))
+        self.assertTrue(z.check_layout(dict(clean, over=["caption"])))
+        self.assertIn("text too long", z.check_layout(dict(clean, over=["caption"]))[0])
+        two = dict(clean, texts=[{"kind": "bubble", "box": box(60, 880, 600, 1000)}, {"kind": "bubble", "box": box(300, 990, 1000, 1100)}])
+        self.assertTrue(any("bubble overlaps bubble" in e for e in z.check_layout(two)))
+        self.assertTrue(z.check_layout(dict(clean, texts=[{"kind": "cta", "box": box(60, 1200, 1200, 1300)}])))   # outside the slide
+
+    def test_too_long_warning_in_editor(self):
+        z = self.zones
+        short = cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": "ठीक है"}, {"speaker": "shopkeeper", "text": "ok"}]})
+        self.assertEqual(z.too_long(short), "")
+        long2 = cartoon.clean_slide({"characters": [{"role": "shopkeeper", "position": "left"}, {"role": "customer", "position": "right"}],
+                                     "dialogue": [{"speaker": "shopkeeper", "text": "बहुत लंबी बात " * 20}, {"speaker": "customer", "text": "छोटा"}]})
+        self.assertIn("text too long", z.too_long(long2))
+        cap = cartoon.clean_slide({"type": "shot", "shots": [{"id": 1}], "narration": "लंबा कैप्शन " * 60})
+        self.assertIn("caption", z.too_long(cap))
+        r = self.cl.post("/api/marketing/story/check", json={"script": {"slides": [short, long2, cap]}}).get_json()
+        self.assertEqual([bool(x) for x in r["notes"]], [False, True, True])
+
+    def test_render_fails_clearly_when_text_does_not_fit_and_mixed_types_render(self):
+        got = self.make_shots(2)
+        b = self.b
+        too = {"title": "t", "slides": [cartoon.clean_slide({"type": "shot", "shots": [{"id": list(got)[0]}], "narration": "लंबा कैप्शन " * 80})]}
+        with self.assertRaises(images.RenderError) as cm:
+            cartoon.render_script(too, b, self.p, pathlib.Path(self.tmp) / "o1", cta="", lookup=got.get)
+        self.assertIn("Slide 1", str(cm.exception))
+        self.assertIn("text too long", str(cm.exception))
+        miss = {"title": "t", "slides": [cartoon.clean_slide({"type": "shot", "shots": [{"id": 12345}], "narration": "x"})]}
+        with self.assertRaises(images.RenderError) as cm:
+            cartoon.render_script(miss, b, self.p, pathlib.Path(self.tmp) / "o2", lookup=got.get)
+        self.assertIn("no screenshot", str(cm.exception))
+        ids = list(got)
+        mixed = {"title": "t", "slides": [
+            cartoon.clean_slide({"dialogue": [{"speaker": "shopkeeper", "text": "नमस्ते"}]}),
+            cartoon.clean_slide({"type": "shot", "shots": [{"id": ids[0], "hl": {"x": .1, "y": .1, "w": .4, "h": .2, "arrow": True}}, {"id": ids[1]}], "layout": "2up", "narration": "दो स्क्रीन"}),
+            cartoon.clean_slide({"type": "device", "device": "phone", "shots": [{"id": ids[0]}], "narration": "फ़ोन", "dialogue": [{"speaker": "shopkeeper", "text": "देखो"}]}),
+            cartoon.clean_slide({"is_cta": True})]}
+        files = cartoon.render_script(mixed, b, self.p, pathlib.Path(self.tmp) / "o3", cta="Call 99999", lookup=got.get, names={"shopkeeper": "Ramesh"})
+        self.assertEqual(len(files), 4)
+        for f in files:
+            self.assertEqual(Image.open(f).size, (1080, 1350))
+
+
 if __name__ == "__main__":
     unittest.main()

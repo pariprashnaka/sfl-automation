@@ -14,9 +14,20 @@ RETRIES = 3
 SLEEP = time.sleep                                        # tests replace this
 
 STYLE = "premium editorial caricature illustration, expressive faces, slightly exaggerated features, warm lighting, small Indian kirana shop, clean composition"
-SAFETY = ("Original fictional characters only, not resembling any real person, celebrity, brand mascot or known cartoon character. "
-          "No text, no letters, no words, no numbers, no logos, no watermarks, no captions, no speech bubbles; any signboard or paper stays blank. "
-          "Characters in the lower two thirds of the frame, calm plain background in the upper third.")
+NO_TEXT = ("No text anywhere: blank signboards, no signs, no readable text, no letters, no numbers, no logos, no watermarks, no captions, no speech bubbles; "
+           "any paper or screen stays blank.")
+SAFETY = ("Original fictional characters only, not resembling any real person, celebrity, brand mascot or known cartoon character. " + NO_TEXT +
+          " Wide horizontal composition, characters centered with the whole upper body visible and a clear margin around them.")
+BG_STYLE = "premium editorial illustration, warm soft lighting, clean uncluttered composition, shallow depth, slightly blurred background"
+BG_PLACES = {"shop": "an empty small Indian kirana shop interior with a wooden counter and shelves",
+             "office": "an empty small Indian office with a plain desk and a window"}
+
+
+def empty_bg_prompt(kind="shop"):
+    """Background for device slides: a place with NOTHING on it that could compete with the screenshot."""
+    return ("%s. %s, seen from the front, no people, no devices, no screens, no computers, no phones, no monitors, no pictures on the walls. %s"
+            % (BG_STYLE, BG_PLACES.get(kind, BG_PLACES["shop"]), NO_TEXT))
+
 
 DEFAULT_CAST = [
     ("shopkeeper", "Ramesh", "middle-aged Indian shopkeeper, round friendly face, thick black moustache, no glasses, short black hair with a little grey, "

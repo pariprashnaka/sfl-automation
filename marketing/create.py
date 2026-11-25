@@ -61,8 +61,8 @@ def create_page():
         "<label>Hashtags <span class='note'>(suggested, popularity not verified)</span></label><div id='tagchips' style='margin:6px 0'></div><textarea id='hashtags' rows='2'></textarea>"
         "<label>Alt-text description</label><textarea id='alt' rows='2'></textarea><div id='notes' class='note'></div>"
         "<div style='margin-top:12px'><button type='button' onclick='saveDraft()'>Save as draft</button> <button type='button' class='grey' onclick='gen()'>Regenerate</button></div></div>") % (bo, to)
-    from . import story_ui
-    return page("/marketing/create", STYLE + story_ui.STYLE + body + story_ui.panel() + CREATE_JS.replace("__BRANDS__", json.dumps({"products": prods})) + story_ui.js(), "Create")
+    from . import story_ui, shots
+    return page("/marketing/create", STYLE + story_ui.STYLE + shots.STYLE + body + story_ui.panel() + CREATE_JS.replace("__BRANDS__", json.dumps({"products": prods})) + shots.js() + story_ui.js(), "Create")
 
 
 def cleanup_previews():
