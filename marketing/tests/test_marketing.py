@@ -665,9 +665,11 @@ class Cartoon(unittest.TestCase):
             _time.sleep(0.2)
         self.assertEqual(j["state"], "done", j["error"])
         self.assertTrue(any(s.startswith("drawing slide") for s in stages | {j["stage"]}))
-        self.assertEqual(len(j["result"]["images"]), 3)
+        self.assertEqual(len(j["result"]["images"]), 4)                       # 3 story slides + the call-to-action slide
+        self.assertTrue(j["result"]["added_cta"] and j["result"]["slides"][-1]["is_cta"])
+        self.assertEqual(set(j["result"]["providers"]), {"svg"})                # no keys in tests: drawn parts
         tok = j["result"]["token"]
-        for k in (1, 2, 3):
+        for k in (1, 2, 3, 4):
             f = mdb.OUT_ROOT / ("p_" + tok) / ("slide_%d.jpg" % k)
             self.assertEqual(Image.open(f).size, (1080, 1350))
             self.assertLess(f.stat().st_size, 8 * 1024 * 1024)
@@ -679,6 +681,161 @@ class Cartoon(unittest.TestCase):
             self.assertIn(needle, h)
         self.assertNotIn("Expiry wastage", h)
         self.assertIn("do dukandaar baat kar rahe hain", h)                    # only inside the Load example text
+
+
+class ImageGen(unittest.TestCase):
+    """Providers with mocked HTTP: cloudflare, gemini (reference image), cap, retries and the SVG fallback."""
+    PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 2000
+
+    def setUp(self):
+        from marketing import imagegen
+        self.ig = imagegen
+        self.tmp = tempfile.mkdtemp()
+        self.old = (imagegen.CACHE_DIR, imagegen.http_post, imagegen.SLEEP)
+        imagegen.CACHE_DIR = pathlib.Path(self.tmp) / "cache"
+        imagegen.SLEEP = lambda s: None
+        self.calls = []
+        self.env = {"CF_ACCOUNT_ID": "acc1", "CF_API_TOKEN": "tok1", "GEMINI_API_KEY": "gk", "GEMINI_IMAGE_MODEL": "some-image-model"}
+        self.settings = {}
+        path = os.path.join(self.tmp, "t.db")
+        c = sqlite3.connect(path)
+        c.executescript(mdb.SCHEMA)
+        c.commit()
+        c.close()
+        self.conn = lambda: sqlite3.connect(path)
+
+    def tearDown(self):
+        self.ig.CACHE_DIR, self.ig.http_post, self.ig.SLEEP = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def env_val(self, k):
+        return self.env.get(k, "")
+
+    def gen(self, prompt="p", hq=False, **kw):
+        return self.ig.generate_chain(prompt, 5, hq, self.env_val, self.conn, lambda k, d: self.settings.get(k, d), **kw)
+
+    def used(self):
+        c = self.conn()
+        try:
+            return self.ig.used_today(c)
+        finally:
+            c.close()
+
+    def b64(self):
+        import base64
+        return base64.b64encode(self.PNG).decode()
+
+    def test_cloudflare_request_shape_cache_and_usage(self):
+        def post(url, headers, payload):
+            self.calls.append((url, headers, payload))
+            return {"result": {"image": self.b64()}}
+        self.ig.http_post = post
+        r = self.gen()
+        self.assertEqual(r["provider"], "cloudflare")
+        self.assertTrue(r["file"].exists())
+        url, hdr, body = self.calls[0]
+        self.assertEqual(url, "https://api.cloudflare.com/client/v4/accounts/acc1/ai/run/@cf/black-forest-labs/flux-1-schnell")
+        self.assertEqual(hdr["Authorization"], "Bearer tok1")
+        self.assertEqual((body["prompt"], body["steps"]), ("p", 6))
+        self.assertEqual(self.used(), {"cloudflare": 1})
+        r2 = self.gen()                                                   # same prompt+seed: cache, no call, no count
+        self.assertTrue(r2["cached"])
+        self.assertEqual((len(self.calls), self.used()), (1, {"cloudflare": 1}))
+
+    def test_gemini_only_with_hq_model_from_env_and_reference(self):
+        def post(url, headers, payload):
+            self.calls.append((url, headers, payload))
+            return {"candidates": [{"content": {"parts": [{"inlineData": {"mime_type": "image/png", "data": self.b64()}}]}}]}
+        self.ig.http_post = post
+        r = self.gen(hq=True, ref=self.PNG)
+        self.assertEqual(r["provider"], "gemini")
+        url, hdr, body = self.calls[0]
+        self.assertIn("/models/some-image-model:generateContent", url)
+        self.assertEqual(hdr["x-goog-api-key"], "gk")
+        self.assertIn("inline_data", body["contents"][0]["parts"][0])     # reference image first
+        self.calls.clear()
+        self.gen(hq=False, prompt="q")                                    # switch off: gemini is never called
+        self.assertTrue(all("generativelanguage" not in c[0] for c in self.calls))
+
+    def test_gemini_unset_says_so_and_falls_back(self):
+        self.env.pop("GEMINI_IMAGE_MODEL")
+        self.ig.http_post = lambda *a: self.fail("no call expected for gemini")
+        self.assertIn("GEMINI_IMAGE_MODEL", self.ig.status(self.env_val)["gemini_msg"])
+        r = self.ig.generate("p", 1, "gemini", self.env_val, self.conn, lambda k, d: d)
+        self.assertEqual((r["file"], r["provider"]), (None, "svg"))
+        self.assertIn("GEMINI_IMAGE_MODEL", r["reason"])
+
+    def test_missing_keys_quota_and_failure_fall_back_to_svg(self):
+        self.ig.http_post = lambda *a: self.fail("no call expected")
+        saved = dict(self.env)
+        self.env.clear()
+        r = self.gen()
+        self.assertEqual((r["file"], r["provider"]), (None, "svg"))
+        self.assertIn("CF_ACCOUNT_ID", r["reason"])
+        self.env.update(saved)
+        self.settings["mkt_img_cap_cloudflare"] = 0                       # quota hit
+        r = self.gen()
+        self.assertEqual(r["provider"], "svg")
+        self.assertIn("daily limit", r["reason"])
+        self.settings.clear()
+        n = []
+
+        def boom(*a):
+            n.append(1)
+            raise self.ig.Retryable("HTTP 503")
+        self.ig.http_post = boom
+        r = self.gen()
+        self.assertEqual((r["file"], r["provider"], len(n)), (None, "svg", self.ig.RETRIES))   # retried, then SVG
+        self.assertEqual(self.used(), {})
+
+    def test_retry_then_success_and_hq_falls_back_to_cloudflare(self):
+        ok = {"result": {"image": self.b64()}}
+        seq = [self.ig.Retryable("HTTP 429"), ok]
+
+        def post(url, h, p):
+            v = seq.pop(0)
+            if isinstance(v, Exception):
+                raise v
+            return v
+        self.ig.http_post = post
+        self.assertEqual(self.gen()["provider"], "cloudflare")
+
+        def post2(url, h, p):
+            if "generativelanguage" in url:
+                raise self.ig.ImageError("HTTP 403: no")
+            return ok
+        self.ig.http_post = post2
+        r = self.gen(hq=True, prompt="other")
+        self.assertEqual(r["provider"], "cloudflare")
+        self.assertIn("gemini", r["note"])
+
+    def test_prompts_have_no_text_rule_cast_and_no_labels(self):
+        cast = [dict(role=r, name=n, description=d, seed=sd) for r, n, d, sd in self.ig.DEFAULT_CAST]
+        slide = cartoon.clean_slide({"scene": "shop_counter", "description": "Shopkeeper2 shows a tablet to Customer, saying \"Namaste ji\"",
+                                     "characters": [{"role": "shopkeeper2", "expression": "happy", "position": "left"}, {"role": "customer", "expression": "surprised", "position": "right"}],
+                                     "dialogue": [{"speaker": "shopkeeper2", "text": "Shopkeeper2: नमस्ते"}], "props": ["tablet"]})
+        prompt, seed = self.ig.scene_prompt(slide, cast, cartoon.SCENES)
+        self.assertTrue(prompt.startswith(self.ig.STYLE))
+        for w in ("No text", "no logos", "no watermarks", "Sunil", "Meena", "round glasses"):
+            self.assertIn(w, prompt)
+        self.assertNotIn("Shopkeeper2", prompt)
+        self.assertNotIn("Namaste", prompt)
+        self.assertNotIn("नमस्ते", prompt)
+        self.assertEqual(seed, 2202)
+        self.assertNotEqual(self.ig.seed_for(seed, 1), seed)
+
+    def test_script_fixes_cta_language_and_labels(self):
+        facts = "InventoryCloud\nStock in one place"
+        d = {"title": "t", "slides": [{"description": "Shopkeeper2 smiles", "characters": [{"role": "shopkeeper", "position": "left"}],
+                                         "dialogue": [{"speaker": "shopkeeper", "text": "Shopkeeper2: stock check"}], "narration": "Customer asks"}] * 3}
+        s = cartoon.clean_script(d, 3, facts, "Hindi", "Call 99999")
+        self.assertEqual(len(s["slides"]), 4)
+        self.assertTrue(s["slides"][-1]["is_cta"])
+        self.assertNotIn("hopkeeper2", json.dumps(s["slides"], ensure_ascii=False))
+        self.assertIn("Devanagari", s["slides"][0]["claim_note"])
+        self.assertEqual(cartoon.script_prompt("b", None, "X", "Hindi", 3, "", "Call 99999").count("Devanagari"), 1)
+        s2 = cartoon.clean_script(d, 3, facts, "Hindi", "")              # no CTA field: nothing is added
+        self.assertEqual(len(s2["slides"]), 3)
 
 
 if __name__ == "__main__":

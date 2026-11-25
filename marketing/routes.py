@@ -48,7 +48,7 @@ def published_last_24h(c):
 
 def health():
     """Booleans only: whether each setting exists. Values are never put on the page."""
-    keys = ["IG_USER_ID", "IG_ACCESS_TOKEN", "CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
+    keys = ["CF_ACCOUNT_ID", "CF_API_TOKEN", "GEMINI_API_KEY", "GEMINI_IMAGE_MODEL", "IG_USER_ID", "IG_ACCESS_TOKEN", "CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET"]
     return [(k, bool(M.env_val(k))) for k in keys]
 
 
@@ -63,6 +63,8 @@ def dashboard():
     c = db()
     counts = {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM posts GROUP BY status")}
     n24 = published_last_24h(c)
+    from . import imagegen
+    iu = imagegen.used_today(c)
     last = c.execute("SELECT p.*, b.name AS bname FROM posts p LEFT JOIN brands b ON b.id=p.brand_id ORDER BY p.id DESC LIMIT 5").fetchall()
     c.close()
     tiles = "".join("<div class='tile'><b>%d</b><small>%s</small></div>" % (counts.get(s, 0), s.capitalize()) for s in
@@ -74,6 +76,7 @@ def dashboard():
     body = flash() + (
         "<div class='tiles'>%s</div><div class='grid'>"
         "<div class='card'><h3>Publishing today</h3><b style='font-size:28px'>%d / %d</b><div class='note'>Posts published in the last 24 hours (cap %d).</div></div>"
+        "<div class='card'><h3>Images used today</h3><b style='font-size:28px'>%s</b><div class='note'>AI illustrations made today (cap per day: Cloudflare %d, Gemini %d). Cached pictures are free.</div></div>"
         "<div class='card'><h3>Connection</h3>%s<div style='margin-top:12px'><button type='button' onclick='testConn()'>Test connection</button> "
         "<span id='tc' class='note'></span></div>"
         "<form method='post' action='/marketing/dry-run' style='margin-top:12px'><span class='chip %s'>Dry run %s</span> "
@@ -82,7 +85,7 @@ def dashboard():
         "<script>function testConn(){var t=document.getElementById('tc');t.textContent='Testing...';"
         "fetch('/api/marketing/test',{method:'POST'}).then(function(r){return r.json()}).then(function(j){t.textContent=j.ok?('Connected as @'+j.username):j.error;})"
         ".catch(function(){t.textContent='Request failed'});}</script>") % (
-        tiles, n24, CAP, CAP, hl, "on" if dry else "bad", "ON" if dry else "OFF", "off" if dry else "on", rows)
+        tiles, n24, CAP, CAP, esc(", ".join("%s %d" % kv for kv in iu.items()) or "0"), imagegen.cap("cloudflare", M.qset), imagegen.cap("gemini", M.qset), hl, "on" if dry else "bad", "ON" if dry else "OFF", "off" if dry else "on", rows)
     return page("/marketing", body)
 
 
@@ -130,6 +133,9 @@ def brands_page():
     c = db()
     brands = c.execute("SELECT * FROM brands ORDER BY id").fetchall()
     prods = c.execute("SELECT * FROM products ORDER BY id").fetchall()
+    cm = {}
+    for m in c.execute("SELECT * FROM cast_members ORDER BY id"):
+        cm.setdefault(m["brand_id"], []).append(m)
     c.close()
     out = [flash()]
     for b in brands:
@@ -148,6 +154,15 @@ def brands_page():
                    "<div style='margin-top:10px'><button>Save product</button> <button class='grey' name='delete' value='1' formnovalidate>Delete</button></div></form></details>") % (
                 esc(p["name"]), "photo uploaded" if ph else "no photo - text-only templates", p["id"], esc(p["name"]), esc(p["description"]),
                 esc(p["key_points"]), esc(p["price_note"]))
+        cast = ""
+        for m in cm.get(b["id"], []):
+            cast += ("<div class='card' style='margin:8px 0'><b>%s</b> <span class='note'>(%s)</span><div class='row'><div><label>Name</label><input name='name_%s' value='%s'></div>"
+                     "<div style='flex:0 0 120px;min-width:100px'><label>Seed</label><input name='seed_%s' type='number' value='%d'></div></div>"
+                     "<label>Fixed visual description (age, face, moustache/glasses, clothes, colours)</label><textarea name='desc_%s' rows='3'>%s</textarea></div>") % (
+                esc(m["name"]), esc(m["role"]), m["role"], esc(m["name"]), m["role"], m["seed"], m["role"], esc(m["description"]))
+        cast = ("<details style='margin-top:14px'><summary>Cast for cartoon stories</summary><div class='note'>Original characters only. Every illustration prompt includes this "
+                "description and uses the seed, so the same person looks the same in every slide.</div><form method='post' action='/marketing/cast/%d'>%s"
+                "<button>Save cast</button></form></details>") % (b["id"], cast)
         tpl = (
             "<div class='card'><h3>%s %s</h3><div>%s</div><form method='post' action='/marketing/brand/%d' enctype='multipart/form-data'>"
             "<div class='row'><div><label>Name</label><input name='name' value='%s'></div><div><label>Instagram handle</label><input name='ig_handle' value='%s'></div></div>"
@@ -156,16 +171,35 @@ def brands_page():
             "<div class='row'><div><label>Footer left</label><input name='footer_left' value='%s'></div><div><label>Footer right</label><input name='footer_right' value='%s'></div></div>"
             "<label>Notes</label><textarea name='notes' rows='2'>%s</textarea><label>Logo (PNG, JPG or WEBP)</label><input type='file' name='logo' accept='image/*'>"
             "<div style='margin-top:10px'><button>Save brand</button></div></form>"
-            "<h3 style='margin-top:18px'>Products</h3>%s"
+            "%s<h3 style='margin-top:18px'>Products</h3>%s"
             "<form method='post' action='/marketing/product/0' style='margin-top:10px'><input type='hidden' name='brand_id' value='%d'>"
             "<div class='row'><div><input name='name' placeholder='New product name'></div><div style='flex:0'><button>Add product</button></div></div></form></div>")
         out.append(tpl % (
             esc(b["name"]), "<span class='chip'>demo</span>" if "demo" in (b["notes"] or "").lower() else "", logo, b["id"],
             esc(b["name"]), esc(b["ig_handle"]), esc(b["accent"]), esc(b["accent"]), esc(b["bg"]), esc(b["bg"]),
-            esc(b["footer_left"]), esc(b["footer_right"]), esc(b["notes"]), pr, b["id"]))
+            esc(b["footer_left"]), esc(b["footer_right"]), esc(b["notes"]), cast, pr, b["id"]))
     out.append("<div class='card'><h3>New brand</h3><form method='post' action='/marketing/brand/0'><div class='row'><div><input name='name' placeholder='Brand name'></div>"
                "<div style='flex:0'><button>Add brand</button></div></div></form></div>")
     return page("/marketing/brands", "".join(out), "Brand kit")
+
+
+@bp.route("/marketing/cast/<int:bid>", methods=["POST"])
+def cast_save(bid):
+    f = request.form
+    c = db()
+    try:
+        for m in c.execute("SELECT * FROM cast_members WHERE brand_id=?", (bid,)).fetchall():
+            r = m["role"]
+            try:
+                seed = int(f.get("seed_" + r, m["seed"]))
+            except ValueError:
+                seed = m["seed"]
+            c.execute("UPDATE cast_members SET name=?, description=?, seed=? WHERE id=?",
+                      ((f.get("name_" + r) or m["name"]).strip()[:40], (f.get("desc_" + r) or m["description"]).strip()[:600], max(0, min(seed, 2147483000)), m["id"]))
+        c.commit()
+    finally:
+        c.close()
+    return back("Cast saved")
 
 
 def back(msg):

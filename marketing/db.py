@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS posts(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id 
   type TEXT DEFAULT 'post', topic TEXT DEFAULT '', caption TEXT DEFAULT '', hashtags TEXT DEFAULT '', description_alt TEXT DEFAULT '',
   image_paths TEXT DEFAULT '[]', status TEXT DEFAULT 'draft', scheduled_at TEXT DEFAULT '', ig_media_id TEXT DEFAULT '', ig_permalink TEXT DEFAULT '',
   error TEXT DEFAULT '', created_at TEXT DEFAULT '', approved_at TEXT DEFAULT '', published_at TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS imagegen_usage(day TEXT NOT NULL, provider TEXT NOT NULL, n INTEGER DEFAULT 0, PRIMARY KEY(day, provider));
+CREATE TABLE IF NOT EXISTS cast_members(id INTEGER PRIMARY KEY AUTOINCREMENT, brand_id INTEGER NOT NULL, role TEXT NOT NULL, name TEXT DEFAULT '',
+  description TEXT DEFAULT '', seed INTEGER DEFAULT 1, UNIQUE(brand_id, role));
 """
 EXTRA_COLS = {"posts": [("template", "TEXT DEFAULT ''"), ("spec_json", "TEXT DEFAULT '{}'")]}
 
@@ -51,6 +54,10 @@ def ensure(c):
                             (name, ac, bg, fl, fr, ig, notes))
             for p in prods:
                 c.execute("INSERT INTO products(brand_id,name,description,key_points,price_note) VALUES(?,?,?,?,?)", (cur.lastrowid,) + p)
+    from . import imagegen
+    for b in c.execute("SELECT id FROM brands").fetchall():
+        for role, nm, desc, seed in imagegen.DEFAULT_CAST:
+            c.execute("INSERT OR IGNORE INTO cast_members(brand_id,role,name,description,seed) VALUES(?,?,?,?,?)", (b[0], role, nm, desc, seed))
     c.commit()
     for name, *_ in SEED:
         (ASSETS / slug(name) / "photos").mkdir(parents=True, exist_ok=True)

@@ -4,7 +4,7 @@ the story, dialogue and claims all come from the script (written by the AI from 
 No known or copied characters: every shape below is drawn from simple primitives.
 """
 import json, re, pathlib
-from . import images
+from . import images, imagegen
 
 SCENES = {"shop_counter": "Shop counter", "shelves": "Shelves behind a counter", "shop_front": "Shop front", "plain": "Plain background"}
 ROLES = {"shopkeeper": "Shopkeeper", "shopkeeper2": "Second shopkeeper", "customer": "Customer"}
@@ -16,6 +16,8 @@ SURFACE = ("tablet", "phone", "notebook", "boxes", "calendar", "receipt", "bag",
 FLOAT = ("lightbulb", "clock", "question", "tick", "cross")                                    # float above the scene
 LANGS = {"Hindi": "Hindi in Devanagari script", "English": "English", "Hinglish": "Hinglish (Hindi written in Roman letters)"}
 MIN_SLIDES, MAX_SLIDES = 3, 8
+DEVANAGARI = re.compile(r'[ऀ-ॿ]')
+PROVIDER_SET = ("cloudflare", "gemini", "svg")
 CLAIM_WORDS = re.compile(r"guarantee|100\s?%|\bbest\b|no\.?\s?1\b|#1|\bfree\b|lifetime|never fail|zero loss|\bonly\b", re.I)
 
 # ---------------- SVG parts ----------------
@@ -154,7 +156,7 @@ def scene_svg(slide):
     scene = slide.get("scene") if slide.get("scene") in SCENES else "shop_counter"
     xs = {"left": 270, "right": 730, "center": 500}
     speakers = {d.get("speaker") for d in slide.get("dialogue", []) if (d.get("text") or "").strip()}
-    out = ["<svg viewBox='0 0 1000 560' xmlns='http://www.w3.org/2000/svg' style='width:100%;height:100%;display:block'>"
+    out = ["<svg viewBox='0 0 1000 560' preserveAspectRatio='xMidYMax meet' xmlns='http://www.w3.org/2000/svg' style='width:100%;height:100%;display:block'>"
            "<defs><clipPath id='cp'><rect width='1000' height='560' rx='36'/></clipPath></defs><g clip-path='url(#cp)'>", scene_bg(scene)]
     for ch in slide.get("characters", [])[:2]:
         cx = xs.get(ch.get("position"), 500)
@@ -180,7 +182,8 @@ def scene_svg(slide):
 # ---------------- script ----------------
 def blank_slide():
     return {"scene": "shop_counter", "description": "", "characters": [{"role": "shopkeeper", "expression": "neutral", "position": "left"}],
-            "props": [], "dialogue": [{"speaker": "shopkeeper", "text": ""}], "narration": "", "claim_note": ""}
+            "props": [], "dialogue": [{"speaker": "shopkeeper", "text": ""}], "narration": "", "claim_note": "", "is_cta": False,
+            "image": "", "provider": "", "img_v": 0, "img_note": ""}
 
 
 def clean_slide(s):
@@ -205,11 +208,15 @@ def clean_slide(s):
     dlg = []
     for d in (s.get("dialogue") or [])[:2]:
         if isinstance(d, dict) and str(d.get("text") or "").strip():
-            dlg.append({"speaker": d.get("speaker") if d.get("speaker") in roles else roles[0], "text": str(d["text"]).strip()})
+            t = imagegen.scrub(d["text"])
+            if t:
+                dlg.append({"speaker": d.get("speaker") if d.get("speaker") in roles else roles[0], "text": t})
     props = [p for p in (s.get("props") or []) if p in PROPS][:4]
-    return {"scene": s.get("scene") if s.get("scene") in SCENES else "shop_counter", "description": str(s.get("description") or "").strip(),
-            "characters": chars, "props": props, "dialogue": dlg, "narration": str(s.get("narration") or "").strip(),
-            "claim_note": str(s.get("unsupported_claim") or s.get("claim_note") or "").strip()}
+    return {"scene": s.get("scene") if s.get("scene") in SCENES else "shop_counter", "description": imagegen.scrub(s.get("description")),
+            "characters": chars, "props": props, "dialogue": dlg, "narration": imagegen.scrub(s.get("narration")),
+            "claim_note": str(s.get("unsupported_claim") or s.get("claim_note") or "").strip(), "is_cta": bool(s.get("is_cta")),
+            "image": imagegen.safe_name(s.get("image")) or "", "provider": s.get("provider") if s.get("provider") in PROVIDER_SET else "",
+            "img_v": int(s.get("img_v") or 0) % 100 if str(s.get("img_v") or "0").isdigit() else 0, "img_note": str(s.get("img_note") or "")[:300]}
 
 
 def claim_flags(slide, facts):
@@ -231,7 +238,34 @@ def product_facts(product):
     return "\n".join(x for x in (product["name"], product["description"] or "", product["key_points"] or "", product["price_note"] or "") if x)
 
 
-def clean_script(d, n, facts, lang=""):
+def has_cta(slide, cta):
+    c = (cta or "").strip().casefold()
+    txt = " ".join([d["text"] for d in slide["dialogue"]] + [slide["narration"]]).casefold()
+    return bool(slide.get("is_cta") or (c and c in txt))
+
+
+def ensure_cta(slides, cta):
+    """Every story ends with a call-to-action slide that shows the CTA field. Returns True if a slide was added or replaced."""
+    if not (cta or "").strip():
+        return False
+    last = slides[-1]
+    if last.get("is_cta"):
+        return False
+    if has_cta(last, cta):
+        last["is_cta"] = True
+        return False
+    ch = dict(last["characters"][0], expression="happy", position="center")
+    new = clean_slide({"scene": "shop_counter", "description": "the shopkeeper smiles warmly at the viewer and invites them in", "characters": [ch],
+                       "props": [], "dialogue": [], "narration": ""})
+    new["is_cta"] = True
+    if len(slides) >= MAX_SLIDES:
+        slides[-1] = new
+    else:
+        slides.append(new)
+    return True
+
+
+def clean_script(d, n, facts, lang="", cta=""):
     d = d if isinstance(d, dict) else {}
     slides = [clean_slide(s) for s in (d.get("slides") or [])][:MAX_SLIDES]
     if not slides:
@@ -239,6 +273,9 @@ def clean_script(d, n, facts, lang=""):
     for s in slides:
         note = claim_flags(s, facts)
         s["claim_note"] = "claim not in product details - confirm before posting" if note else ""
+        if lang == "Hindi" and s["dialogue"] and not any(DEVANAGARI.search(x["text"]) for x in s["dialogue"]):
+            s["claim_note"] = s["claim_note"] or "dialogue is not in Devanagari - edit it or Regenerate slide"
+    ensure_cta(slides, cta)
     return {"title": str(d.get("title") or "").strip(), "caption": str(d.get("caption") or "").strip(), "alt": str(d.get("alt") or "").strip(),
             "hashtags_raw": d.get("hashtags") or [], "slides": slides, "language": lang}
 
@@ -259,15 +296,16 @@ def script_prompt(brief, product, brand_name, language, n, tone, cta):
         "The owner describes the story in their own words (Hindi, English or Hinglish):\n<<<\n%s\n>>>\n\n"
         "PRODUCT FACTS (the only product claims you may state):\n%s\n\n"
         "Rules:\n- Write exactly %d slides telling the story in order. Each slide has 1 or 2 short dialogue lines (max 14 words each), spoken by the characters in it.\n"
-        "- Dialogue and narration language: %s. Tone: %s.\n"
+        "- Dialogue and narration language: %s. Tone: %s. Never write internal labels such as Shopkeeper, Shopkeeper2 or Customer inside dialogue, narration or descriptions.\n"
+        "- The description field is one plain English sentence describing the picture only (people, what they do, the place). No dialogue, no quotes, no text on signs.\n"
         "- You may ONLY state product claims that appear in PRODUCT FACTS. If the story asks for a claim that is not there (a number, price, guarantee, feature), "
         "write the slide without it and put a short note of the missing claim in that slide's unsupported_claim. Never invent numbers, prices or results.\n"
         "- Choose every visual ONLY from this list of drawn parts:\n%s\n"
-        "- Max 2 characters per slide; props max 4. The last slide ends with this call to action (in the dialogue or narration): %s\n"
+        "- Max 2 characters per slide; props max 4. The LAST slide is a call-to-action slide: the shopkeeper (happy) invites the viewer, no new story; the call to action is exactly: %s\n"
         "- Brand: %s. Also write caption (2-4 short sentences), alt (one plain sentence describing the carousel), and hashtags "
         "(object with arrays broad, niche, local; 12-15 in total; local tags relate to Buxar and Bihar; no spam tags).\n"
         "Return ONLY JSON in this shape:\n%s"
-    ) % (brief.strip(), facts, n, LANGS.get(language, LANGS["Hinglish"]), tone or "Friendly", parts_text(), cta or "(none)", brand_name, SHAPE)
+    ) % (brief.strip(), facts, n, LANGS.get(language, LANGS["Hindi"]), tone or "Friendly", parts_text(), cta or "(none)", brand_name, SHAPE)
 
 
 def slide_prompt(script, index, brief, product, language, tone, instruction=""):
@@ -286,27 +324,43 @@ def slide_prompt(script, index, brief, product, language, tone, instruction=""):
 CSS = """<style>
 body{font-family:'Seg','Segoe UI','Nirmala UI',sans-serif}
 .cart{flex:1;min-height:0;display:flex;flex-direction:column;gap:20px}
-.bbs{display:flex;flex-direction:column;gap:16px;flex:none}
-.bb{background:#f4f4f5;color:#111;border-radius:34px;padding:22px 30px;font-size:46px;line-height:1.3;max-width:80%;overflow:hidden;position:relative;font-weight:700}
-.bb.l{align-self:flex-start;border-bottom-left-radius:8px}.bb.r{align-self:flex-end;border-bottom-right-radius:8px}
-.scn{flex:1;min-height:0;border-radius:36px;overflow:hidden}
+.scn{position:relative;flex:1;min-height:0;max-height:878px;border-radius:36px;overflow:hidden;background:#1a1a1d}
+.scn img.ill{width:100%;height:100%;object-fit:cover;display:block}
+.scn .svgw{position:absolute;inset:0}
+.bbs{position:absolute;left:24px;right:24px;top:22px;display:flex;flex-direction:column;gap:34px;z-index:3}
+.bw{position:relative;width:100%}
+.bb{background:#fff;color:#111;border-radius:34px;padding:20px 28px;font-size:42px;line-height:1.28;max-width:78%;min-width:44%;width:fit-content;overflow:hidden;font-weight:700;box-shadow:0 6px 22px rgba(0,0,0,.35)}
+.bw.l .bb{margin-right:auto}.bw.r .bb{margin-left:auto}.bw.c .bb{margin:0 auto;min-width:0}
+.tail{position:absolute;bottom:-26px;width:0;height:0;border-left:18px solid transparent;border-right:18px solid transparent;border-top:30px solid #fff;transform:translateX(-50%);filter:drop-shadow(0 6px 4px rgba(0,0,0,.25))}
 .nar{font-size:36px;line-height:1.3;color:__MU__;flex:none;overflow:hidden}
+.cta.cbig{align-self:center;font-size:48px;padding:28px 60px;text-align:center}
 </style>"""
+
+TAILX = {"left": 27, "right": 73, "center": 50}
 
 
 def slide_html(spec, script, i):
     s = script["slides"][i]
     n = len(script["slides"])
     pos = {c["role"]: c["position"] for c in s["characters"]}
-    bubbles = "".join("<div class='bb %s' data-fit style='max-height:210px'>%s</div>" % ("r" if pos.get(d["speaker"]) == "right" else "l", images.e(d["text"]))
-                      for d in s["dialogue"])
-    nar = "<div class='nar' data-fit style='max-height:140px'>%s</div>" % images.e(s["narration"]) if s["narration"] else ""
-    cta = images.cta_html(spec) if i == n - 1 else ""
-    body = "%s<div class='cart'><div class='bbs'>%s</div><div class='scn'>%s</div></div>%s%s" % (CSS.replace("__MU__", "#b4b4bc"), bubbles, scene_svg(s), nar, cta)
+    bw = []
+    for d in s["dialogue"]:
+        p = pos.get(d["speaker"], "center")
+        bw.append("<div class='bw %s'><div class='bb' data-fit style='max-height:170px'>%s</div><i class='tail' style='left:%d%%'></i></div>" % (
+            {"left": "l", "right": "r"}.get(p, "c"), images.e(d["text"]), TAILX.get(p, 50)))
+    f = s.get("_file")
+    pic = ("<img class='ill' src='%s'>" % images.uri(f)) if f else "<div class='svgw'>%s</div>" % scene_svg(s)
+    nar = "<div class='nar' data-fit style='max-height:110px'>%s</div>" % images.e(s["narration"]) if s["narration"] else ""
+    cta = images.cta_html(spec).replace("class='cta'", "class='cta cbig'") if i == n - 1 else ""
+    body = "%s<div class='cart'><div class='scn'>%s<div class='bbs'>%s</div></div></div>%s%s" % (CSS.replace("__MU__", "#b4b4bc"), pic, "".join(bw), nar, cta)
     return images.frame(spec, body, tag="%d / %d" % (i + 1, n), deco=False)
 
 
-def render_script(script, brand, product, out_dir, cta="", progress=None):
+def slide_prompt_for(slide, cast):
+    return imagegen.scene_prompt(slide, cast, SCENES)
+
+
+def render_script(script, brand, product, out_dir, cta="", progress=None, get_image=None):
     """Render the script exactly as written to slide_N.jpg files (1080x1350). One slide at a time, browser closed after each."""
     msg = images.ram_message()
     if msg:
@@ -323,6 +377,7 @@ def render_script(script, brand, product, out_dir, cta="", progress=None):
     for i in range(n):
         if progress:
             progress("drawing slide %d of %d" % (i + 1, n))
+        script["slides"][i]["_file"] = get_image(i) if get_image else None
         hp = out_dir / ("_c%d.html" % i)
         hp.write_text(images.page_html(spec, slide_html(spec, script, i), w, h), encoding="utf-8")
         path = out_dir / ("slide_%d.jpg" % (i + 1))

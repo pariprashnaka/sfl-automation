@@ -16,7 +16,7 @@ STYLE = """<style>
 .mk .sl .inl>*{flex:1;min-width:110px}.mk .sl .inl>button{flex:none;min-width:0}
 .mk .warn{background:rgba(245,165,36,.16);border:1px solid #f5c542;color:#ffd666;border-radius:10px;padding:8px 12px;margin:8px 0;font-size:13px}
 .mk .props label{display:inline-flex;align-items:center;margin:2px 10px 2px 0;color:var(--text)}
-.mk #sprog{margin-left:10px}
+.mk #sprog{margin-left:10px}.mk .sl .thumb{height:96px;border-radius:8px;margin:6px 10px 6px 0;vertical-align:middle}
 </style>"""
 
 
@@ -27,9 +27,13 @@ def panel():
         "<label>Describe the story you want (Hindi, English or Hinglish, any length)</label>"
         "<textarea id='sbrief' rows='7' style='font-size:16px' placeholder='Write the story in your own words'></textarea>"
         "<div style='margin:6px 0'><button type='button' class='grey' onclick='loadExample()'>Load example</button></div>"
-        "<div class='row'><div><label>Dialogue language</label><select id='slang'><option>Hinglish</option><option>Hindi</option><option>English</option></select></div>"
+        "<div class='row'><div><label>Dialogue language</label><select id='slang'><option>Hindi</option><option>Hinglish</option><option>English</option></select></div>"
         "<div><label>Number of slides (3-8)</label><input id='snum' type='number' min='3' max='8' value='5'></div></div>"
-        "<div class='note'>Product, tone and call-to-action are taken from the fields above.</div>"
+        "<div class='row'><div><label>Illustrations</label><select id='simg' onchange='imgStatus()'><option value='ai'>AI illustrations (free, Cloudflare)</option>"
+        "<option value='svg'>Drawn parts only (no AI)</option></select></div>"
+        "<div><label>&nbsp;</label><label style='display:flex;gap:8px;align-items:center;color:var(--text)'><input type='checkbox' id='shq' onchange='imgStatus()'> High quality (Gemini, paid)</label></div></div>"
+        "<div id='imgst' class='note' style='margin:4px 0'></div>"
+        "<div class='note'>Product, tone and call-to-action are taken from the fields above. The AI never draws text: Hindi lines are added by the vault.</div>"
         "<div style='margin-top:12px'><button type='button' id='swrite' onclick='writeScript()'>Write script</button><span id='sprog' class='note' role='status'></span></div>"
         "<div id='sedit' style='display:none;margin-top:16px'><h3>Script <span class='note'>(edit anything, then Render)</span></h3>"
         "<label>Title</label><input id='stitle'><label>Caption</label><textarea id='scap' rows='3'></textarea>"
@@ -37,7 +41,7 @@ def panel():
         "<label>Alt-text description</label><textarea id='salt' rows='2'></textarea><div id='slides'></div>"
         "<div style='margin-top:10px'><button type='button' class='grey' onclick='addSlide(SCRIPT.slides.length-1)'>Add slide at end</button> "
         "<button type='button' class='grey' onclick='writeScript()'>Regenerate whole script</button> "
-        "<button type='button' id='srender' onclick='renderStory()'>Render</button></div></div></div>"
+        "<button type='button' id='srender' onclick='renderStory()'>Render</button></div><div id='provs' class='note' style='margin-top:10px'></div></div></div>"
         "<div class='lb' id='lb' hidden><button class='x' type='button' onclick='lbClose()'>Close</button>"
         "<button class='nav' type='button' onclick='lbStep(-1)' aria-label='Previous'>&lt;</button><img id='lbimg' alt=''>"
         "<button class='nav' type='button' onclick='lbStep(1)' aria-label='Next'>&gt;</button></div>")
@@ -56,9 +60,15 @@ function poll(id,stage,done){var t=setInterval(function(){fetch('/api/marketing/
   if(!j.ok){clearInterval(t);stage(j.error,true);return;}
   if(j.state=='running'){stage(j.stage);return;}clearInterval(t);
   if(j.state=='error'){stage(j.error,true);}else{done(j.result);}}).catch(function(){});},1500);}
+function imgStatus(){fetch('/api/marketing/story/imgstatus').then(function(r){return r.json()}).then(function(j){var m=[];
+  if($('simg').value=='ai'&&!j.cloudflare)m.push(j.cloudflare_msg+' Until then slides use the drawn parts.');
+  if($('shq').checked&&!j.gemini)m.push(j.gemini_msg+' Falls back to the free provider.');
+  var u=Object.keys(j.used||{}).map(function(k){return k+' '+j.used[k];}).join(', ');m.push('Images made today: '+(u||'none'));$('imgst').textContent=m.join(' ');}).catch(function(){});}
+function regenImage(i){sync();busy(true);prog('drawing picture for slide '+(i+1));post('/api/marketing/story/image',payload({script:SCRIPT,index:i})).then(function(j){if(!j.ok){prog(j.error,true);return;}
+  poll(j.job,prog,function(r){SCRIPT.slides[r.index]=r.slide;busy(false);prog('Picture for slide '+(r.index+1)+' made by '+r.slide.provider+(r.slide.img_note?' ('+r.slide.img_note+')':'')+'.');drawSlides();imgStatus();});});}
 function busy(on){['swrite','srender'].forEach(function(i){var b=$(i);if(b)b.disabled=on;});}
 function prog(t,bad){var p=$('sprog');p.textContent=t;p.style.color=bad?'var(--bad)':'var(--muted)';if(bad)busy(false);}
-function payload(extra){var o={brand_id:$('brand').value,product_id:$('product').value,tone:$('tone').value,cta:$('cta').value,language:$('slang').value,slides:$('snum').value,brief:$('sbrief').value};
+function payload(extra){var o={brand_id:$('brand').value,product_id:$('product').value,tone:$('tone').value,cta:$('cta').value,language:$('slang').value,imgmode:$('simg').value,hq:$('shq').checked,slides:$('snum').value,brief:$('sbrief').value};
  for(var k in extra)o[k]=extra[k];return o;}
 function post(u,o){return fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)}).then(function(r){return r.json()});}
 function writeScript(){if(!$('sbrief').value.trim()){prog('Describe the story first.',true);return;}busy(true);prog('writing script');
@@ -73,8 +83,9 @@ function drawSlides(){$('slides').innerHTML=SCRIPT.slides.map(function(s,i){
  var roles={};s.characters.forEach(function(c){roles[c.role]=OPT.roles[c.role];});
  var dl=s.dialogue.map(function(d,k){return "<div class='inl'><select style='max-width:160px' onchange='setd("+i+","+k+",\"speaker\",this.value)'>"+opts(roles,d.speaker)+"</select>"+
   "<textarea rows='2' style='flex:3' oninput='setd("+i+","+k+",\"text\",this.value)'>"+esc(d.text)+"</textarea><button type='button' class='grey' onclick='deld("+i+","+k+")'>x</button></div>";}).join('');
- return "<div class='sl'><h4><span>Slide "+(i+1)+"</span><span><button type='button' class='grey' onclick='regenSlide("+i+")'>Regenerate slide</button> <button type='button' class='grey' onclick='addSlide("+i+")'>Add below</button> "+
+ return "<div class='sl'><h4><span>Slide "+(i+1)+"</span><span><button type='button' class='grey' onclick='regenImage("+i+")'>Regenerate image</button> <button type='button' class='grey' onclick='regenSlide("+i+")'>Regenerate slide</button> <button type='button' class='grey' onclick='addSlide("+i+")'>Add below</button> "+
   "<button type='button' class='grey' onclick='delSlide("+i+")'>Remove</button></span></h4>"+(s.claim_note?"<div class='warn'>"+esc(s.claim_note)+"</div>":"")+
+  "<div class='note'>"+(s.image?"<img class='thumb' src='/marketing/img/"+s.image+"'>":"")+(s.provider?"Picture: "+s.provider+(s.provider=='svg'?" (drawn parts)":"")+(s.img_note?" - "+esc(s.img_note):""):"Picture: made when you press Render")+"</div>"+(s.is_cta?"<div class='note'>Call-to-action slide</div>":"")+
   "<label>Scene</label><select onchange='sets("+i+",\"scene\",this.value)'>"+opts(OPT.scenes,s.scene)+"</select><label>What the scene shows (note)</label><input value=\""+esc(s.description)+"\" oninput='sets("+i+",\"description\",this.value)'>"+
   "<label>Characters, expression, position</label>"+chars+(s.characters.length<2?"<button type='button' class='grey' onclick='addc("+i+")'>+ character</button>":"")+
   "<label>Props</label><div class='props'>"+props+"</div><label>Dialogue</label>"+dl+(s.dialogue.length<2?"<button type='button' class='grey' onclick='addd("+i+")'>+ line</button>":"")+
@@ -93,7 +104,8 @@ function regenSlide(i){sync();busy(true);prog('rewriting slide '+(i+1));post('/a
   poll(j.job,prog,function(r){SCRIPT.slides[r.index]=r.slide;busy(false);prog('Slide '+(r.index+1)+' rewritten.');drawSlides();});});}
 function renderStory(){sync();if(!SCRIPT){return;}busy(true);prog('starting render');
  post('/api/marketing/story/render',payload({script:SCRIPT})).then(function(j){if(!j.ok){prog(j.error,true);return;}
-  poll(j.job,prog,function(r){busy(false);prog('Rendered '+r.images.length+' slides. Click a picture to enlarge.');TOKEN=r.token;LAST={spec:SCRIPT,tiers:SCRIPT.tiers||{}};
+  poll(j.job,prog,function(r){busy(false);prog('Rendered '+r.images.length+' slides. Click a picture to enlarge.'+(r.added_cta?' A call-to-action slide was added.':''));TOKEN=r.token;
+   if(r.slides){SCRIPT.slides=r.slides;drawSlides();}$('provs').textContent='Pictures by slide: '+(r.slides||[]).map(function(s,k){return (k+1)+' '+(s.provider||'svg')+(s.provider=='svg'&&s.img_note?' ('+s.img_note+')':'');}).join(' | ');imgStatus();LAST={spec:SCRIPT,tiers:SCRIPT.tiers||{}};
    $('result').style.display='block';$('imgs').innerHTML=r.images.map(function(u){return "<img class='pv' style='max-width:200px;margin:0 10px 10px 0' src='"+u+"?t="+Date.now()+"'>"}).join('');
    $('caption').value=SCRIPT.caption||'';$('hashtags').value=SCRIPT.hashtags||'';$('alt').value=SCRIPT.alt||'';$('notes').textContent='Hashtags are suggested; popularity is not verified.';drawTags();
    $('result').scrollIntoView({behavior:'smooth'});});});}
@@ -104,7 +116,7 @@ $('imgs').addEventListener('click',function(e){var im=e.target.closest('img');if
 $('lb').addEventListener('click',function(e){if(e.target.id=='lb')lbClose();});
 document.addEventListener('keydown',function(e){if($('lb').hidden)return;if(e.key=='Escape')lbClose();else if(e.key=='ArrowRight')lbStep(1);else if(e.key=='ArrowLeft')lbStep(-1);});
 window.addEventListener('pageshow',function(){lbClose();});
-$('type').addEventListener('change',toggleType);toggleType();
+$('type').addEventListener('change',toggleType);toggleType();imgStatus();
 </script>"""
 
 
